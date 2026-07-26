@@ -1,0 +1,13 @@
+{
+  "name": "phase0-spike-js-client",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A5: unmodified @microsoft/signalr client proving the negotiate redirect + connect flow. Scaffolding only, discarded when Phase 1 folds this into the real integration test.",
+  "scripts": {
+    "check": "node redirect-check.mjs"
+  },
+  "dependencies": {
+    "@microsoft/signalr": "^8.0.7"
+  }
+}
