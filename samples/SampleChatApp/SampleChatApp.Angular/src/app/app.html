@@ -1,0 +1,26 @@
+<main>
+  <h1>Switchboard Sample Chat</h1>
+
+  @if (!auth.isLoggedIn()) {
+    <form (ngSubmit)="login()" class="login">
+      <input name="username" [(ngModel)]="usernameInput" placeholder="username" autocomplete="off" />
+      <button type="submit" [disabled]="!usernameInput">Log in</button>
+      @if (loginError()) {
+        <p class="error">{{ loginError() }}</p>
+      }
+    </form>
+  } @else {
+    <div class="chat">
+      <div class="sidebar">
+        <p>Logged in as <strong>{{ auth.username() }}</strong> <button type="button" (click)="logout()">Log out</button></p>
+        <app-room-list (roomSelected)="onRoomSelected($event)" />
+      </div>
+
+      @if (activeRoomId(); as roomId) {
+        <app-chat-room [roomId]="roomId" />
+      } @else {
+        <p>Pick a room to join.</p>
+      }
+    </div>
+  }
+</main>

@@ -4,13 +4,11 @@ using Keryhe.Switchboard.Protocol;
 namespace Keryhe.Switchboard.Server.Routing;
 
 /// <summary>
-/// Central dispatch engine (04-design.md §5). Phase 1 fully implements client-message routing,
-/// targeted send, and broadcast. Group/user fan-out (<see cref="SendToGroupAsync"/>,
-/// <see cref="SendToUserAsync"/>) is deliberately a log-and-no-op in Phase 1 — the wire format is
-/// exercised by the Connector (plan decision D3), but real routing to group/user members is a
-/// Phase 2 deliverable. This is a scope decision, not an oversight: implementing it now would be
-/// easy given <see cref="IConnectionRegistry"/> already tracks membership, but the plan explicitly
-/// defers it to bound Phase 1's scope.
+/// Central dispatch engine (04-design.md §5). Group and user fan-out
+/// (<see cref="SendToGroupAsync"/>, <see cref="SendToUserAsync"/>) were a deliberate
+/// log-and-no-op in Phase 1 (plan decision D3); Phase 2 implements real routing using the
+/// membership/user indexes <see cref="IConnectionRegistry"/> already tracked, plus mixed-protocol
+/// payload selection per connection (plan decision D7).
 /// </summary>
 public sealed class DefaultMessageRouter(
     IConnectionRegistry connectionRegistry,
@@ -18,6 +16,13 @@ public sealed class DefaultMessageRouter(
     ILocalTransportRegistry localTransportRegistry,
     ILogger<DefaultMessageRouter> logger) : IMessageRouter
 {
+    /// <summary>Connections per fan-out batch (04-design.md §5).</summary>
+    private const int BatchSize = 256;
+
+    /// <summary>Bounded parallelism within a batch — writes are non-blocking
+    /// (<c>DropWrite</c>), so this bounds concurrent registry/channel lookups, not I/O wait.</summary>
+    private static readonly int MaxDegreeOfParallelism = Math.Min(8, Environment.ProcessorCount);
+
     public async ValueTask RouteClientMessageAsync(string connectionId, ReadOnlyMemory<byte> payload, string hubProtocol, CancellationToken ct)
     {
         var state = await connectionRegistry.GetAsync(connectionId, ct);
@@ -55,36 +60,83 @@ public sealed class DefaultMessageRouter(
         await transport.Output.Writer.WriteAsync(payload, ct);
     }
 
-    public async ValueTask BroadcastAsync(string hubName, ReadOnlyMemory<byte> payload, string hubProtocol, IReadOnlySet<string>? excludedConnectionIds, CancellationToken ct)
+    public ValueTask BroadcastAsync(string hubName, ReadOnlyMemory<byte> payload, string hubProtocol, IReadOnlyDictionary<string, byte[]>? payloadsByProtocol, IReadOnlySet<string>? excludedConnectionIds, CancellationToken ct) =>
+        FanOutAsync(connectionRegistry.GetAllAsync(hubName, ct), payload, hubProtocol, payloadsByProtocol, excludedConnectionIds, ct);
+
+    public ValueTask SendToGroupAsync(string hubName, string groupName, ReadOnlyMemory<byte> payload, string hubProtocol, IReadOnlyDictionary<string, byte[]>? payloadsByProtocol, IReadOnlySet<string>? excludedConnectionIds, CancellationToken ct) =>
+        FanOutAsync(connectionRegistry.GetGroupMembersAsync(hubName, groupName, ct), payload, hubProtocol, payloadsByProtocol, excludedConnectionIds, ct);
+
+    public ValueTask SendToUserAsync(string hubName, string userId, ReadOnlyMemory<byte> payload, string hubProtocol, IReadOnlyDictionary<string, byte[]>? payloadsByProtocol, CancellationToken ct) =>
+        FanOutAsync(connectionRegistry.GetUserConnectionsAsync(hubName, userId, ct), payload, hubProtocol, payloadsByProtocol, excludedConnectionIds: null, ct);
+
+    /// <summary>
+    /// Partitioned parallel fan-out (04-design.md §5): batch the target set, then write each
+    /// batch with bounded parallelism. Every write lands on a per-connection channel configured
+    /// with <c>DropWrite</c> (00-review-findings.md), so a slow client sheds messages instead of
+    /// stalling fan-out for everyone else — this method never awaits a slow client.
+    /// </summary>
+    private async ValueTask FanOutAsync(
+        IAsyncEnumerable<Core.Models.ClientConnectionState> targets,
+        ReadOnlyMemory<byte> payload,
+        string hubProtocol,
+        IReadOnlyDictionary<string, byte[]>? payloadsByProtocol,
+        IReadOnlySet<string>? excludedConnectionIds,
+        CancellationToken ct)
     {
-        await foreach (var state in connectionRegistry.GetAllAsync(hubName, ct))
+        var batch = new List<(string ConnectionId, byte[] Payload)>(BatchSize);
+
+        await foreach (var state in targets.WithCancellation(ct))
         {
             if (excludedConnectionIds?.Contains(state.ConnectionId) == true)
             {
                 continue;
             }
 
-            var transport = localTransportRegistry.Get(state.ConnectionId);
-            if (transport is not null)
+            var targetProtocol = state.HubProtocol ?? "json";
+            byte[]? bytes = null;
+            if (payloadsByProtocol is not null && payloadsByProtocol.TryGetValue(targetProtocol, out var protocolBytes))
             {
-                await transport.Output.Writer.WriteAsync(payload, ct);
+                bytes = protocolBytes;
             }
+            else if (targetProtocol == hubProtocol)
+            {
+                bytes = payload.ToArray();
+            }
+
+            if (bytes is null)
+            {
+                logger.LogWarning(
+                    "Fan-out skipped connection {ConnectionId}: no payload for its negotiated protocol {Protocol} (plan decision D7).",
+                    state.ConnectionId, targetProtocol);
+                continue;
+            }
+
+            batch.Add((state.ConnectionId, bytes));
+            if (batch.Count == BatchSize)
+            {
+                await WriteBatchAsync(batch, ct);
+                batch.Clear();
+            }
+        }
+
+        if (batch.Count > 0)
+        {
+            await WriteBatchAsync(batch, ct);
         }
     }
 
-    public ValueTask SendToGroupAsync(string hubName, string groupName, ReadOnlyMemory<byte> payload, string hubProtocol, IReadOnlySet<string>? excludedConnectionIds, CancellationToken ct)
+    private async Task WriteBatchAsync(List<(string ConnectionId, byte[] Payload)> batch, CancellationToken ct)
     {
-        logger.LogWarning(
-            "SendToGroupAsync for group '{GroupName}' on hub '{HubName}' received but not routed: group/user fan-out is a Phase 2 deliverable (plan decision D3).",
-            groupName, hubName);
-        return ValueTask.CompletedTask;
-    }
-
-    public ValueTask SendToUserAsync(string hubName, string userId, ReadOnlyMemory<byte> payload, string hubProtocol, CancellationToken ct)
-    {
-        logger.LogWarning(
-            "SendToUserAsync for user '{UserId}' on hub '{HubName}' received but not routed: group/user fan-out is a Phase 2 deliverable (plan decision D3).",
-            userId, hubName);
-        return ValueTask.CompletedTask;
+        await Parallel.ForEachAsync(
+            batch,
+            new ParallelOptions { MaxDegreeOfParallelism = MaxDegreeOfParallelism, CancellationToken = ct },
+            async (item, token) =>
+            {
+                var transport = localTransportRegistry.Get(item.ConnectionId);
+                if (transport is not null)
+                {
+                    await transport.Output.Writer.WriteAsync(item.Payload, token);
+                }
+            });
     }
 }

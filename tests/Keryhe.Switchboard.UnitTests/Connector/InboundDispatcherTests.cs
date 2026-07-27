@@ -24,12 +24,13 @@ public class InboundDispatcherTests
         services.AddSignalR();
         services.AddSingleton<HubRouteNameRegistry>();
         services.AddSingleton<ConnectorConnectionPoolRegistry>();
+        services.AddSingleton<HubPipelineFactory>();
+        services.AddSingleton<InboundDispatcher>();
         services.AddSingleton(typeof(HubLifetimeManager<>), typeof(SwitchboardHubLifetimeManager<>));
         var provider = services.BuildServiceProvider();
         provider.GetRequiredService<HubRouteNameRegistry>().Register(typeof(TestHub), "testHub");
 
-        var pipelineFactory = new HubPipelineFactory(provider);
-        var dispatcher = new InboundDispatcher(pipelineFactory, NullLogger<InboundDispatcher>.Instance);
+        var dispatcher = provider.GetRequiredService<InboundDispatcher>();
 
         var sent = new List<ServerEnvelope>();
         Task SendToService(ServerEnvelope e, CancellationToken ct) { sent.Add(e); return Task.CompletedTask; }

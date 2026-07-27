@@ -1,3 +1,4 @@
+using Keryhe.Switchboard.Connector.Dispatch;
 using Keryhe.Switchboard.Connector.ServerConnections;
 using Keryhe.Switchboard.Protocol;
 using Microsoft.AspNetCore.SignalR;
@@ -10,15 +11,25 @@ namespace Keryhe.Switchboard.Connector;
 /// an envelope sent to the service over the hub's <see cref="ConnectorConnectionPool"/>. Inbound
 /// dispatch (<c>OnConnectedAsync</c>, argument binding, streaming, ...) runs over the synthetic
 /// connection pipeline instead — see <see cref="Dispatch.InboundDispatcher"/> — and never goes
-/// through this type. Group/user sends are emitted here per plan decision D3 even though the
-/// service does not yet route them (that's a Phase 2 deliverable); emitting now exercises the wire
-/// format so Phase 2 is a service-side-only change.
+/// through this type.
 /// </summary>
+/// <remarks>
+/// Mixed-protocol fan-out (plan decision D7): a broadcast/group/user send's recipient set may mix
+/// JSON and MessagePack clients, and the Connector cannot know that mix in advance, so
+/// <see cref="ServerEnvelope.Payloads"/> carries one correctly-encoded copy per protocol the
+/// service supports — the service picks the entry matching each target's own negotiated
+/// protocol. Targeted sends (<c>Clients.Client</c>/<c>Clients.Caller</c>/<c>Clients.Clients</c>)
+/// address exactly one known connection, so they look its protocol up via
+/// <see cref="InboundDispatcher.GetHubProtocol"/> and send a single correctly-encoded payload
+/// instead.
+/// </remarks>
 public sealed class SwitchboardHubLifetimeManager<THub>(
     ConnectorConnectionPoolRegistry poolRegistry,
-    HubRouteNameRegistry hubRouteNameRegistry) : HubLifetimeManager<THub> where THub : Hub
+    HubRouteNameRegistry hubRouteNameRegistry,
+    InboundDispatcher inboundDispatcher) : HubLifetimeManager<THub> where THub : Hub
 {
-    private static readonly IHubProtocol JsonProtocol = new JsonHubProtocol();
+    private static readonly IHubProtocol Json = new JsonHubProtocol();
+    private static readonly IHubProtocol MessagePack = new MessagePackHubProtocol();
 
     private string HubName => hubRouteNameRegistry.GetName(typeof(THub));
 
@@ -32,7 +43,8 @@ public sealed class SwitchboardHubLifetimeManager<THub>(
             Type = ServerEnvelopeType.Broadcast,
             HubName = HubName,
             HubProtocol = "json",
-            Payload = BuildFrame(methodName, args),
+            Payload = BuildFrame(Json, methodName, args),
+            Payloads = BuildAllProtocolFrames(methodName, args),
         }, cancellationToken);
 
     public override Task SendAllExceptAsync(string methodName, object?[] args, IReadOnlyList<string> excludedConnectionIds, CancellationToken cancellationToken = default) =>
@@ -41,31 +53,28 @@ public sealed class SwitchboardHubLifetimeManager<THub>(
             Type = ServerEnvelopeType.Broadcast,
             HubName = HubName,
             HubProtocol = "json",
-            Payload = BuildFrame(methodName, args),
+            Payload = BuildFrame(Json, methodName, args),
+            Payloads = BuildAllProtocolFrames(methodName, args),
             ExcludedConnectionIds = excludedConnectionIds,
         }, cancellationToken);
 
-    public override Task SendConnectionAsync(string connectionId, string methodName, object?[] args, CancellationToken cancellationToken = default) =>
-        SendEnvelopeAsync(new ServerEnvelope
+    public override Task SendConnectionAsync(string connectionId, string methodName, object?[] args, CancellationToken cancellationToken = default)
+    {
+        var protocolName = inboundDispatcher.GetHubProtocol(connectionId) ?? "json";
+        return SendEnvelopeAsync(new ServerEnvelope
         {
             Type = ServerEnvelopeType.SendToConnection,
             ConnectionId = connectionId,
-            HubProtocol = "json",
-            Payload = BuildFrame(methodName, args),
+            HubProtocol = protocolName,
+            Payload = BuildFrame(Resolve(protocolName), methodName, args),
         }, cancellationToken);
+    }
 
     public override async Task SendConnectionsAsync(IReadOnlyList<string> connectionIds, string methodName, object?[] args, CancellationToken cancellationToken = default)
     {
-        var frame = BuildFrame(methodName, args);
         foreach (var connectionId in connectionIds)
         {
-            await SendEnvelopeAsync(new ServerEnvelope
-            {
-                Type = ServerEnvelopeType.SendToConnection,
-                ConnectionId = connectionId,
-                HubProtocol = "json",
-                Payload = frame,
-            }, cancellationToken);
+            await SendConnectionAsync(connectionId, methodName, args, cancellationToken);
         }
     }
 
@@ -76,12 +85,13 @@ public sealed class SwitchboardHubLifetimeManager<THub>(
             HubName = HubName,
             GroupName = groupName,
             HubProtocol = "json",
-            Payload = BuildFrame(methodName, args),
+            Payload = BuildFrame(Json, methodName, args),
+            Payloads = BuildAllProtocolFrames(methodName, args),
         }, cancellationToken);
 
     public override async Task SendGroupsAsync(IReadOnlyList<string> groupNames, string methodName, object?[] args, CancellationToken cancellationToken = default)
     {
-        var frame = BuildFrame(methodName, args);
+        var payloads = BuildAllProtocolFrames(methodName, args);
         foreach (var groupName in groupNames)
         {
             await SendEnvelopeAsync(new ServerEnvelope
@@ -90,7 +100,8 @@ public sealed class SwitchboardHubLifetimeManager<THub>(
                 HubName = HubName,
                 GroupName = groupName,
                 HubProtocol = "json",
-                Payload = frame,
+                Payload = payloads["json"],
+                Payloads = payloads,
             }, cancellationToken);
         }
     }
@@ -102,7 +113,8 @@ public sealed class SwitchboardHubLifetimeManager<THub>(
             HubName = HubName,
             GroupName = groupName,
             HubProtocol = "json",
-            Payload = BuildFrame(methodName, args),
+            Payload = BuildFrame(Json, methodName, args),
+            Payloads = BuildAllProtocolFrames(methodName, args),
             ExcludedConnectionIds = excludedConnectionIds,
         }, cancellationToken);
 
@@ -113,12 +125,13 @@ public sealed class SwitchboardHubLifetimeManager<THub>(
             HubName = HubName,
             UserId = userId,
             HubProtocol = "json",
-            Payload = BuildFrame(methodName, args),
+            Payload = BuildFrame(Json, methodName, args),
+            Payloads = BuildAllProtocolFrames(methodName, args),
         }, cancellationToken);
 
     public override async Task SendUsersAsync(IReadOnlyList<string> userIds, string methodName, object?[] args, CancellationToken cancellationToken = default)
     {
-        var frame = BuildFrame(methodName, args);
+        var payloads = BuildAllProtocolFrames(methodName, args);
         foreach (var userId in userIds)
         {
             await SendEnvelopeAsync(new ServerEnvelope
@@ -127,7 +140,8 @@ public sealed class SwitchboardHubLifetimeManager<THub>(
                 HubName = HubName,
                 UserId = userId,
                 HubProtocol = "json",
-                Payload = frame,
+                Payload = payloads["json"],
+                Payloads = payloads,
             }, cancellationToken);
         }
     }
@@ -151,11 +165,24 @@ public sealed class SwitchboardHubLifetimeManager<THub>(
     private Task SendEnvelopeAsync(ServerEnvelope envelope, CancellationToken ct) =>
         poolRegistry.SendAsync(HubName, envelope, ct).AsTask();
 
-    private static byte[] BuildFrame(string methodName, object?[] args)
+    private static IReadOnlyDictionary<string, byte[]> BuildAllProtocolFrames(string methodName, object?[] args) =>
+        new Dictionary<string, byte[]>
+        {
+            ["json"] = BuildFrame(Json, methodName, args),
+            ["messagepack"] = BuildFrame(MessagePack, methodName, args),
+        };
+
+    private static IHubProtocol Resolve(string hubProtocol) => hubProtocol switch
+    {
+        "messagepack" => MessagePack,
+        _ => Json,
+    };
+
+    private static byte[] BuildFrame(IHubProtocol protocol, string methodName, object?[] args)
     {
         var message = new InvocationMessage(methodName, args);
         var writer = new System.Buffers.ArrayBufferWriter<byte>();
-        JsonProtocol.WriteMessage(message, writer);
+        protocol.WriteMessage(message, writer);
         return writer.WrittenMemory.ToArray();
     }
 }

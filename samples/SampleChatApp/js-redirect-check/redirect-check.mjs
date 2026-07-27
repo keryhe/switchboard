@@ -1,20 +1,48 @@
-// A5: an unmodified @microsoft/signalr client negotiates against the MapHub-mapped /testHub
-// route, follows the redirect purely via SwitchboardNegotiateMatcherPolicy, and reaches the
-// stub target's WebSocket. No SignalR fork, no reflection into internals.
+// Slice 9 (Phase 2): an unmodified @microsoft/signalr client negotiates against SampleChatApp.Api's
+// MapHub-mapped /chatHub route, follows the two-step redirect through to Switchboard's WebSocket
+// transport (no SignalR fork, no reflection into internals), then proves the connection actually
+// works end to end by round-tripping a real hub method invocation — not just reaching the
+// Connected state, which the negotiate redirect alone could produce even if routing were broken.
 //
 // Usage: node redirect-check.mjs [baseUrl]
-// Expects the host already running (see spike plan §3/A5), e.g.:
-//   dotnet run --project ../Phase0.Spike.Host --urls http://localhost:5559
+// Expects both real hosts already running:
+//   dotnet run --project ../../../src/Keryhe.Switchboard.Server
+//   dotnet run --project ../SampleChatApp.Api
+//   npm install && node redirect-check.mjs http://localhost:5001
 
-import { HubConnectionBuilder, HttpTransportType } from "@microsoft/signalr";
+import { HubConnectionBuilder } from "@microsoft/signalr";
 
-const baseUrl = process.argv[2] ?? "http://localhost:5559";
+const baseUrl = process.argv[2] ?? "http://localhost:5001";
+const username = `redirect-check-${Date.now()}`;
+
+async function login() {
+  const response = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Login failed: ${response.status} ${await response.text()}`);
+  }
+
+  const { accessToken } = await response.json();
+  return accessToken;
+}
+
+const accessToken = await login();
 
 const connection = new HubConnectionBuilder()
-  .withUrl(`${baseUrl}/testHub`, {
-    transport: HttpTransportType.WebSockets,
+  .withUrl(`${baseUrl}/chatHub`, {
+    accessTokenFactory: () => accessToken,
   })
   .build();
+
+const roomId = "redirect-check-room";
+const messageReceived = new Promise((resolve, reject) => {
+  connection.on("ReceiveMessage", (msg) => resolve(msg));
+  setTimeout(() => reject(new Error("Timed out waiting for ReceiveMessage")), 10_000);
+});
 
 try {
   await connection.start();
@@ -26,16 +54,17 @@ try {
 
   console.log("PASS: @microsoft/signalr client reached Connected via the negotiate redirect.");
 
-  const observedResponse = await fetch(`${baseUrl}/__diag/stub-observed`);
-  const observed = await observedResponse.json();
+  await connection.invoke("JoinRoom", roomId);
+  await connection.invoke("SendMessage", roomId, "redirect-check-ping");
 
-  if (!observed.connectedHubs.includes("testHub") || !observed.negotiatedHubs.includes("testHub")) {
-    console.error("FAIL: stub target did not observe the expected negotiate/connect for testHub");
-    console.error(JSON.stringify(observed));
+  const msg = await messageReceived;
+  if (msg.from !== username || msg.text !== "redirect-check-ping") {
+    console.error("FAIL: round-tripped message did not match what was sent.");
+    console.error(JSON.stringify(msg));
     process.exit(1);
   }
 
-  console.log("PASS: stub target observed both the step-2 negotiate and the socket upgrade.");
+  console.log("PASS: hub method invocation round-tripped through Switchboard back to this client.");
 
   await connection.stop();
   process.exit(0);

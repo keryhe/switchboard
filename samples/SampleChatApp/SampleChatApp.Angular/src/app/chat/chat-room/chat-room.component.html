@@ -1,0 +1,14 @@
+<div class="chat-room">
+  <h3>Room: {{ roomId }}</h3>
+
+  <ul class="feed">
+    @for (entry of feed(); track $index) {
+      <li [class]="entry.kind">{{ entry.text }}</li>
+    }
+  </ul>
+
+  <form (ngSubmit)="sendMessage()">
+    <input name="draft" [ngModel]="draft()" (ngModelChange)="draft.set($event)" placeholder="Say something..." autocomplete="off" />
+    <button type="submit">Send</button>
+  </form>
+</div>

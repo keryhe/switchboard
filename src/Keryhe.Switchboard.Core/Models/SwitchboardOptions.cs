@@ -41,6 +41,13 @@ public sealed class SwitchboardOptions
     public TimeSpan ClientHandshakeTimeout { get; set; } = TimeSpan.FromSeconds(5);
     public int MaxClientConnectionsPerHub { get; set; } = 0;
 
+    // --- SSE / Long Polling (Phase 2 Slices 5/6) ---
+    // WebSocket has a socket-close event and needs neither: a connection with no in-flight poll
+    // for this long is considered gone, and a long-poll GET waits this long for a message before
+    // returning 204. Defaults match ASP.NET Core's own HttpConnectionDispatcherOptions.
+    public TimeSpan DisconnectTimeout { get; set; } = TimeSpan.FromSeconds(15);
+    public TimeSpan LongPollTimeout { get; set; } = TimeSpan.FromSeconds(90);
+
     // --- Write channel ---
     public int WriteChannelCapacity { get; set; } = 256;
     public BoundedChannelFullMode WriteChannelFullMode { get; set; } = BoundedChannelFullMode.DropWrite;

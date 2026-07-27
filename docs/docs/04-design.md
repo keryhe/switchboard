@@ -50,6 +50,14 @@ public string[] TrustedProxyNetworks { get; set; } = [];   // CIDR, e.g. ["10.0.
 3. **Allowlist enforced per request.** The identity headers are honored only when the peer address falls inside `TrustedProxyNetworks`. On every other request they are **stripped before processing** and the connection is treated as anonymous — never merely ignored, so a spoofed header cannot survive into claims.
 4. **Evaluate against the immediate peer.** Match on the directly connected peer address, not a `X-Forwarded-For` value, unless ASP.NET Core's `ForwardedHeadersMiddleware` is configured with its own `KnownProxies`/`KnownNetworks` allowlist — otherwise the check is spoofable by the very header it is meant to guard.
 
+*Evaluation order (Phase 2, implemented).* A single `POST /{hub}/negotiate` request is dispatched in this exact order — Pattern A's allowlist is consulted only once neither token validates, and only when `EnableDirectNegotiate` is on:
+
+1. Valid server token (`ServerSigningKey`, `role: appserver`) → Pattern B step 1; identity headers are trusted **unconditionally** — the trust boundary here is the token, never the network, so a server-token request is never subject to the `TrustedProxyNetworks` allowlist even from a peer outside it.
+2. Valid client token (`TokenSigningKey`) → step 2, as always.
+3. No valid token, `EnableDirectNegotiate` on, peer inside `TrustedProxyNetworks` → Pattern A step 1; identity headers trusted.
+4. No valid token, `EnableDirectNegotiate` on, peer outside `TrustedProxyNetworks` → Pattern A step 1, but **anonymous** — headers stripped (rule 3 above), no `401`. This surprises people: enabling Pattern A never turns an untrusted request away at this point, it just downgrades it to anonymous. A connection is still issued.
+5. Otherwise → `401`.
+
 > **Pattern B remains the recommended path** for any deployment with an ASP.NET Core app server. Pattern A trades an application-level trust boundary for a network-level one, and is only as strong as the network isolation behind it.
 
 **Pattern B — App-Server-Forwarded Negotiate (recommended)**  
@@ -125,11 +133,13 @@ public record NegotiateResponse(
 > **Why two phases:** `HubProtocol` is only known after the client responds to the handshake. The registry registration must happen before the handshake (to reserve the connection slot and assign a server connection), so `HubProtocol` is nullable and updated in a second call after the handshake completes.
 
 ### Message Loop
-Two concurrent loops run per client connection:
+Two concurrent loops run per client connection, plus a third for keep-alive (Phase 2):
 
-**Read loop:** Read frames from client transport → deserialize → route to Message Router → forward to app server via server connection envelope.
+**Read loop:** Read frames from client transport → classify → route to Message Router → forward to app server via server connection envelope. A hub-level `Ping` (plan decision **D13**) is **absorbed here, never forwarded** — the service owns client keep-alive end to end, so a client's own keep-alive `Ping` never reaches the app server as a spurious `client_message`.
 
 **Write loop:** Dequeue messages from per-connection write channel → serialize using client's hub protocol → write frame to client transport.
+
+**Keep-alive ping loop (Phase 2, implemented):** a `PeriodicTimer` on `ClientKeepAliveInterval` writes a hub-level `Ping` to the client for the lifetime of the connection, independent of whether the app server or the client itself is sending anything. **This did not exist until Phase 2 Slice 9** — `ClientKeepAliveInterval` was declared in `SwitchboardOptions` back in Phase 1 but never wired to anything, so an idle-but-healthy connection would silently trip the real client's own `ServerTimeout` (30s default) and reconnect needlessly; found by running the Angular sample in a real browser rather than by any automated test, since every prior end-to-end test completes in well under a second. See [00-review-findings.md § Phase 2 Slice 9](00-review-findings.md).
 
 The write channel provides backpressure isolation: the read loop never blocks waiting for a slow write.
 
@@ -268,46 +278,98 @@ public interface IMessageRouter
     // App server sent a targeted message; route to the specific client
     ValueTask RouteToConnectionAsync(string connectionId, ReadOnlyMemory<byte> payload, string hubProtocol, CancellationToken ct);
 
-    // App server broadcasts; fan out to all hub clients
-    ValueTask BroadcastAsync(string hubName, ReadOnlyMemory<byte> payload, string hubProtocol, IReadOnlySet<string>? excludedConnectionIds, CancellationToken ct);
+    // App server broadcasts; fan out to all hub clients. payloadsByProtocol carries one entry per
+    // hub protocol (plan decision D7, implemented Phase 2 Slice 3) — a broadcast/group/user send
+    // doesn't know each recipient's protocol in advance, so the Connector always sends both a
+    // "json" and a "messagepack" encoding; the router picks whichever entry matches each
+    // recipient's own negotiated protocol. payload/hubProtocol remain the single-protocol
+    // fallback for envelopes without payloadsByProtocol. A target whose protocol has no matching
+    // entry is skipped and logged — never sent the wrong bytes.
+    ValueTask BroadcastAsync(string hubName, ReadOnlyMemory<byte> payload, string hubProtocol, IReadOnlyDictionary<string, byte[]>? payloadsByProtocol, IReadOnlySet<string>? excludedConnectionIds, CancellationToken ct);
 
-    // Fan out to group members
-    ValueTask SendToGroupAsync(string hubName, string groupName, ReadOnlyMemory<byte> payload, string hubProtocol, IReadOnlySet<string>? excludedConnectionIds, CancellationToken ct);
+    // Fan out to group members — same mixed-protocol handling as BroadcastAsync.
+    ValueTask SendToGroupAsync(string hubName, string groupName, ReadOnlyMemory<byte> payload, string hubProtocol, IReadOnlyDictionary<string, byte[]>? payloadsByProtocol, IReadOnlySet<string>? excludedConnectionIds, CancellationToken ct);
 
-    // Fan out to all connections for a user
-    ValueTask SendToUserAsync(string hubName, string userId, ReadOnlyMemory<byte> payload, string hubProtocol, CancellationToken ct);
+    // Fan out to all connections for a user — same mixed-protocol handling as BroadcastAsync.
+    ValueTask SendToUserAsync(string hubName, string userId, ReadOnlyMemory<byte> payload, string hubProtocol, IReadOnlyDictionary<string, byte[]>? payloadsByProtocol, CancellationToken ct);
 }
 ```
 
-### Broadcast Fan-out Strategy
+> **`RouteToConnectionAsync` carries only a single `payload`/`hubProtocol`, never `payloadsByProtocol`** — a targeted send has exactly one recipient, whose protocol the sender already knows (03-protocol.md §2.3).
 
-For large hubs (10,000+ clients), naive sequential fan-out is too slow. The router uses partitioned parallel fan-out:
+### Fan-out Strategy (Phase 1/2, implemented)
 
-1. Retrieve all connection IDs for the hub from the registry (paginated)
-2. Partition into batches (e.g., 256 connections per batch)
-3. Process batches in parallel using `Parallel.ForEachAsync` with bounded degree of parallelism
-4. Each batch writes to the per-connection write channel (non-blocking)
-5. Slow clients accumulate backpressure in their channel; when the channel is full, the message is dropped and the connection is flagged (configurable policy: drop or close)
+Group and user fan-out (Phase 1 deliverable; deferred no further after plan decision **D3**'s
+Phase 1 log-and-no-op placeholder) and broadcast fan-out all route through the same node-local
+path: the registry resolves the hub/group/user to a set of `ClientConnectionState`, each connection
+picks its own payload from `payloadsByProtocol` (or falls back to `payload`) via its recorded
+`hubProtocol`, and the write goes through that connection's bounded per-connection write channel
+(`WriteChannelCapacity`/`WriteChannelFullMode`, default `DropWrite`) — never a blocking write, so
+one slow client cannot stall fan-out to every other client. This is explicitly **node-local**: all
+of it goes through `ILocalTransportRegistry`, and cross-node fan-out remains `IBackplane`'s
+job — still `NoOpBackplane` in Phase 2, unchanged from Phase 1. The batched/partitioned
+`Parallel.ForEachAsync` large-hub strategy originally sketched here remains a Phase 3+ scaling
+concern, not yet needed at Phase 2's tested scale.
 
 ---
 
 ## 6. Transport Abstraction Layer
 
-All three transports implement `IClientTransport`. The transport layer handles:
-- Frame reading and writing
-- Keep-alive pings (WebSocket ping/pong frames at the transport level; distinct from hub-level `Ping` messages)
-- Timeout detection for Long Polling
+Implemented (Phase 2, plan decision **D10**) as a layered interface hierarchy rather than one flat
+`IClientTransport`, because SSE and Long Polling need capabilities WebSocket doesn't:
+
+```csharp
+// Core — transport-agnostic: an output pipe for the router to write into, and a byte stream to
+// read inbound frames from. Every transport implements this.
+public interface IClientTransport : IAsyncDisposable
+{
+    Pipe Output { get; }
+    IAsyncEnumerable<ReadOnlyMemory<byte>> ReadAllAsync(CancellationToken ct);
+    Task CloseAsync(string? error = null);
+}
+
+// Server — adds what the handshake/lifecycle needs to know about the physical transport itself.
+public interface IFramedClientTransport : IClientTransport
+{
+    IHubProtocolFraming Framing { get; set; }       // switched to the negotiated protocol post-handshake
+    bool SupportsBinaryTransferFormat { get; }       // false for SSE — gates messagepack at handshake
+}
+
+// Server — SSE and Long Polling only: their inbound frames arrive over a *separate* HTTP request
+// (POST) from whichever request is currently serving output (the open GET for SSE, the current
+// poll for Long Polling) — WebSocket doesn't need this, since one socket carries both directions.
+public interface IPostableClientTransport : IFramedClientTransport
+{
+    Task FeedAsync(ReadOnlyMemory<byte> data, CancellationToken ct);
+}
+```
+
+`ClientConnectionLifecycle` (handshake negotiation, registration, the message loop, teardown, and
+the keep-alive ping loop) is written once against `IFramedClientTransport`/`IPostableClientTransport`
+and reused unchanged by all three transports — only how bytes physically get in and out differs:
 
 ### WebSocket Transport
-Uses `System.Net.WebSockets.WebSocket` (Kestrel's managed WebSocket). Reads are processed via `System.IO.Pipelines` for zero-copy frame parsing.
+`WebSocketClientTransport` (`IFramedClientTransport`, `SupportsBinaryTransferFormat: true`). Uses
+`System.Net.WebSockets.WebSocket` (Kestrel's managed WebSocket); reads are processed via
+`System.IO.Pipelines` for zero-copy frame parsing. Its entire lifecycle is one HTTP request — the
+upgraded connection itself.
 
 ### SSE Transport
-Read side: HTTP POST endpoint writes to the connection's input channel.  
-Write side: `response.Body` streamed as `text/event-stream`.
+`SseClientTransport` (`IPostableClientTransport`, `SupportsBinaryTransferFormat: false` — Text
+only, 03-protocol.md §1.5). The establishing GET stays open for the connection's life, writing
+`Output`'s frames out as `data: ...` lines; a separate POST feeds inbound frames via `FeedAsync`.
+Response headers must be explicitly flushed after `StartAsync` (`03-protocol.md` §1.5) — Kestrel
+does not do this implicitly, and the real client's transport hangs waiting for them otherwise.
 
 ### Long Polling Transport
-Read: POST body buffered and queued to input channel.  
-Write: pending long-poll GET requests answered with accumulated output messages (up to configurable timeout or until messages arrive).
+`LongPollingClientTransport` (`IPostableClientTransport`, `SupportsBinaryTransferFormat: true`).
+Unlike the other two, its lifecycle spans many independent short-lived HTTP requests rather than
+one long-lived one: the establishing GET registers the transport and returns immediately (the real
+client's `StartAsync` only checks the status code); the handshake and message loop then run
+detached on a background task, fed by later POSTs (`FeedAsync`) and drained by later polling GETs
+(`PollAsync`, `03-protocol.md` §1.6) — a plain timeout returns 200/empty, never 204, and 204 is
+reserved for genuine closure. A background `LongPollingReaperService` closes any transport whose
+last poll exceeds `DisconnectTimeout`, since there is no socket-close event to notice abandonment.
 
 ---
 
@@ -520,13 +582,14 @@ app.UseCors("Switchboard");
 | Endpoint | Why |
 |---|---|
 | `POST /hubName/negotiate` | Browser sends preflight OPTIONS before the negotiate POST |
-| `GET /hubName` (WebSocket upgrade) | Browser sends `Origin` header; service must respond with `Access-Control-Allow-Origin` |
-| `POST /hubName` (SSE send) | Preflight required |
+| `POST` / `DELETE /hubName` (SSE/Long Polling send/close) | Preflight required; covered by the same `app.UseCors("Switchboard")` default policy — verified directly (`CorsAndOriginEndToEndTests`), not assumed |
 | `GET /api/v1/...` (management API) | Only if called from a browser; typically not |
+
+> **`GET /hubName` (WebSocket upgrade) is deliberately *not* in this table — it is not a CORS-protected request at all.** Browsers do not preflight a WebSocket upgrade and never enforce `Access-Control-Allow-Origin` on one; `app.UseCors` has no effect on it (a risk called out explicitly in the Phase 2 plan, since it's easy to assume otherwise). The upgrade handler (`ClientConnectionValidation.IsOriginAllowed`, called from `ClientConnectionEndpoint`) enforces `AllowedOrigins` itself instead: a request whose `Origin` header doesn't match the allowlist is rejected `403` before any token validation runs. A request with **no** `Origin` header at all (the .NET client, and any other non-browser caller) is allowed through regardless of `AllowedOrigins` — only browsers send `Origin`, and the point of this check is to stop a browser page on an unlisted origin from opening a socket directly, not to gate non-browser clients.
 
 ### App-Server-Side CORS (SampleChatApp.Api)
 
-The API's `/api/chatHub/negotiate` endpoint is called by Angular. Standard ASP.NET Core CORS applies:
+The API's `/chatHub/negotiate` endpoint (mapped at the bare `/chatHub` — see the route-correction note in [08-sample-app.md](08-sample-app.md)) is called by Angular. Standard ASP.NET Core CORS applies:
 
 ```csharp
 builder.Services.AddCors(options =>
@@ -683,7 +746,11 @@ So the Connector runs a read loop on `_fromHub.Reader`, parsing with the connect
 
 - **Drops** the handshake response (`{}`) — the service already sent the real one to the client.
 - **Drops** `PingMessage` — the service owns client keep-alive ([§3 Health Monitoring](#3-server-connection-manager)); forwarding would double-ping.
-- **Forwards** everything else as a `send_to_connection` envelope for this `connectionId`, as raw frame bytes.
+- **Forwards** everything else — `StreamItem`, `Completion` (including a faulted stream's `HubException`), and hub-level `Close` alike — as a `send_to_connection` envelope for this `connectionId`, as the **exact original bytes** `TryParseMessage` consumed, never re-serialized.
+
+> **Verified, not built (Phase 2 Slice 7, plan decision D12).** Server→client streaming (`StreamItem`/`Completion`), client→server streaming, `CancelInvocation`, and `Send`/`SendCore` (invocation with no `invocationId`, so no `Completion` is ever sent) all needed **no new mechanism** — they ride this same envelope path unchanged, across every transport and both hub protocols.
+>
+> **One real bug found and fixed: the outbound reader was lossy for MessagePack.** It originally parsed each outbound `HubMessage` with an `EmptyBinder` (`GetReturnType`/`GetStreamItemType` → `typeof(object)`, since the Connector doesn't know the hub method's real CLR return/stream-item types from raw bytes alone) and then **re-serialized** the parsed message before forwarding. For JSON this happened to survive by accident — the loosely-typed value round-trips through a `JsonElement` — but for MessagePack, arguments and stream items reconstructed from `object`-typed CLR values do not reliably re-encode to the same bytes. **Fix:** the reader now parses only to *classify* (Ping vs. Close vs. everything else) and forwards the exact span `TryParseMessage` consumed — captured as `before.Slice(0, before.Length - buffer.Length)` bracketing the parse call — never re-encoding anything. See [00-review-findings.md § Phase 2 Slice 7](00-review-findings.md).
 
 ### Rejection path
 

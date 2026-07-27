@@ -1,7 +1,6 @@
-using System.Text;
-using System.Text.Json;
 using Keryhe.Switchboard.Core;
 using Keryhe.Switchboard.Protocol;
+using Keryhe.Switchboard.Protocol.Framing;
 
 namespace Keryhe.Switchboard.Server.ServerConnections;
 
@@ -30,6 +29,7 @@ public sealed class RoutingServerEnvelopeDispatcher(
                     envelope.HubName!,
                     envelope.Payload!,
                     envelope.HubProtocol!,
+                    envelope.Payloads,
                     envelope.ExcludedConnectionIds?.ToHashSet(),
                     ct);
                 break;
@@ -40,12 +40,13 @@ public sealed class RoutingServerEnvelopeDispatcher(
                     envelope.GroupName!,
                     envelope.Payload!,
                     envelope.HubProtocol!,
+                    envelope.Payloads,
                     envelope.ExcludedConnectionIds?.ToHashSet(),
                     ct);
                 break;
 
             case ServerEnvelopeType.SendToUser:
-                await router.SendToUserAsync(envelope.HubName!, envelope.UserId!, envelope.Payload!, envelope.HubProtocol!, ct);
+                await router.SendToUserAsync(envelope.HubName!, envelope.UserId!, envelope.Payload!, envelope.HubProtocol!, envelope.Payloads, ct);
                 break;
 
             case ServerEnvelopeType.AddToGroup:
@@ -68,17 +69,18 @@ public sealed class RoutingServerEnvelopeDispatcher(
 
     private async Task CloseClientConnectionAsync(string connectionId, string? error, CancellationToken ct)
     {
+        var state = await connectionRegistry.GetAsync(connectionId, ct);
+
         var transport = localTransportRegistry.Get(connectionId);
         if (transport is not null)
         {
-            var closeFrame = JsonSerializer.SerializeToUtf8Bytes(new { type = 7, error });
-            var framed = new System.Buffers.ArrayBufferWriter<byte>();
-            JsonFrameProtocol.WriteFrame(framed, closeFrame);
-            await transport.Output.Writer.WriteAsync(framed.WrittenMemory, ct);
+            // Encoded in the connection's own negotiated protocol (state.HubProtocol) so a
+            // MessagePack client receives a MessagePack-framed Close, not JSON.
+            var closeFrame = ClientFrameWriter.Close(state?.HubProtocol ?? "json", error);
+            await transport.Output.Writer.WriteAsync(closeFrame, ct);
             await transport.CloseAsync(error);
         }
 
-        var state = await connectionRegistry.GetAsync(connectionId, ct);
         if (state is not null)
         {
             hubRegistry.GetHub(state.HubName)?.ServerConnections.GetValueOrDefault(state.ServerConnectionId)?.DecrementLogicalCount();

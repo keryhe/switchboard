@@ -1,5 +1,4 @@
 using System.Security.Claims;
-using System.Text;
 using System.Text.Json;
 using Keryhe.Switchboard.Core;
 using Keryhe.Switchboard.Core.Models;
@@ -9,10 +8,21 @@ using Microsoft.Extensions.Options;
 namespace Keryhe.Switchboard.Server.Negotiate;
 
 /// <summary>
-/// POST /{hub}/negotiate. Dispatches between the two negotiate steps purely on the *validated*
-/// token type (plan decision D1) — never on a caller-controlled query parameter or header, since
-/// getting this wrong lets a client token mint redirects or an app-server token claim a client
-/// connection.
+/// POST /{hub}/negotiate. Dispatches purely on the *validated* token type (plan decision D1) —
+/// never on a caller-controlled query parameter or header — extended by plan decision D11 for
+/// Pattern A (service-direct negotiate, 04-design.md §1): a request with no valid token at all
+/// falls through to the network allowlist only when <c>EnableDirectNegotiate</c> is on, and even
+/// then the allowlist governs whether asserted identity is <em>believed</em>, never whether the
+/// endpoint answers — a request from outside <c>TrustedProxyNetworks</c> still gets a connection,
+/// just an anonymous one, with the identity headers stripped rather than merely ignored.
+/// Evaluation order, matching D11 exactly:
+/// 1. Valid server token → Pattern B step 1, identity headers trusted unconditionally (the trust
+///    boundary is the token, not the network).
+/// 2. Valid client token → step 2.
+/// 3. No valid token, direct negotiate enabled, peer inside the allowlist → Pattern A step 1,
+///    identity headers trusted.
+/// 4. No valid token, direct negotiate enabled, peer outside → Pattern A step 1, anonymous.
+/// 5. Otherwise → 401.
 /// </summary>
 public static class NegotiateEndpoint
 {
@@ -24,54 +34,56 @@ public static class NegotiateEndpoint
         IOptions<SwitchboardOptions> options)
     {
         var authHeader = context.Request.Headers.Authorization.ToString();
-        if (!authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        var token = authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
+            ? authHeader["Bearer ".Length..].Trim()
+            : null;
+
+        if (!string.IsNullOrEmpty(token))
+        {
+            var serverPrincipal = tokenService.Validate(token, SwitchboardTokenType.Server);
+            if (serverPrincipal is not null)
+            {
+                var requiredHubs = serverPrincipal.FindAll("hubs").Select(c => c.Value).ToHashSet();
+                await HandleStep1Async(context, hub, requiredHubs, negotiationService, options.Value, trusted: true);
+                return;
+            }
+
+            var clientPrincipal = tokenService.Validate(token, SwitchboardTokenType.Client);
+            if (clientPrincipal is not null)
+            {
+                await HandleStep2Async(context, hub, clientPrincipal, negotiationService);
+                return;
+            }
+        }
+
+        if (!options.Value.EnableDirectNegotiate)
         {
             context.Response.StatusCode = StatusCodes.Status401Unauthorized;
             return;
         }
 
-        var token = authHeader["Bearer ".Length..].Trim();
-
-        var serverPrincipal = tokenService.Validate(token, SwitchboardTokenType.Server);
-        if (serverPrincipal is not null)
-        {
-            await HandleStep1Async(context, hub, serverPrincipal, negotiationService, options.Value);
-            return;
-        }
-
-        var clientPrincipal = tokenService.Validate(token, SwitchboardTokenType.Client);
-        if (clientPrincipal is not null)
-        {
-            await HandleStep2Async(context, hub, clientPrincipal, negotiationService);
-            return;
-        }
-
-        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        var trustedPeer = DirectNegotiateIdentity.IsTrustedPeer(context.Connection.RemoteIpAddress, options.Value.TrustedProxyNetworks);
+        await HandleStep1Async(context, hub, requiredHubs: null, negotiationService, options.Value, trusted: trustedPeer);
     }
 
     private static async Task HandleStep1Async(
         HttpContext context,
         string hub,
-        ClaimsPrincipal serverPrincipal,
+        IReadOnlySet<string>? requiredHubs,
         INegotiationService negotiationService,
-        SwitchboardOptions options)
+        SwitchboardOptions options,
+        bool trusted)
     {
-        var hubs = serverPrincipal.FindAll("hubs").Select(c => c.Value).ToHashSet();
-        if (!hubs.Contains(hub))
+        // Only Pattern B (a server token) carries a hub restriction to check — Pattern A has no
+        // token to carry one, matching 04-design.md §1's "identical to Pattern B, with the
+        // service playing both roles."
+        if (requiredHubs is not null && !requiredHubs.Contains(hub))
         {
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
             return;
         }
 
-        string? userId = context.Request.Headers.TryGetValue(options.TrustedIdentityHeader, out var userIdValues)
-            ? userIdValues.ToString()
-            : null;
-
-        List<Claim>? claims = null;
-        if (context.Request.Headers.TryGetValue(options.TrustedClaimsHeader, out var claimsHeader) && claimsHeader.Count > 0)
-        {
-            claims = DecodeClaims(claimsHeader.ToString());
-        }
+        var (userId, claims) = DirectNegotiateIdentity.ExtractIdentity(context, options, trusted);
 
         var redirect = await negotiationService.IssueRedirectAsync(hub, userId, claims, context.RequestAborted);
 
@@ -121,13 +133,6 @@ public static class NegotiateEndpoint
         var writer = new System.Buffers.ArrayBufferWriter<byte>();
         NegotiateProtocol.WriteResponse(negotiationResponse, writer);
         await context.Response.Body.WriteAsync(writer.WrittenMemory, context.RequestAborted);
-    }
-
-    private static List<Claim> DecodeClaims(string base64)
-    {
-        var json = Encoding.UTF8.GetString(Convert.FromBase64String(base64));
-        var dict = JsonSerializer.Deserialize<Dictionary<string, string>>(json) ?? [];
-        return dict.Select(kv => new Claim(kv.Key, kv.Value)).ToList();
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);

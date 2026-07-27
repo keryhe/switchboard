@@ -21,14 +21,15 @@ public class ServerEnvelopeSerializerTests
         ServerEnvelopeSerializer.Write(buffer, envelope);
 
         // Pinned expected bytes: 4-byte big-endian length prefix followed by the MessagePack
-        // array-of-11-fields encoding (Type=5 (ClientMessage), ConnectionId, HubName=nil,
+        // array-of-12-fields encoding (Type=5 (ClientMessage), ConnectionId, HubName=nil,
         // GroupName=nil, UserId=nil, HubProtocol, Payload=bin, ExcludedConnectionIds=nil,
-        // Claims=nil, Error=nil, Version=nil). A change to this byte sequence means the
-        // [Key(n)] contract moved.
+        // Claims=nil, Error=nil, Version=nil, Payloads=nil). A change to this byte sequence means
+        // the [Key(n)] contract moved. Payloads was appended at Key(11) (Phase 2, plan decision
+        // D7) — additive only; Key(0..10) bytes are unchanged from the Phase 1 pin.
         byte[] expected =
         [
-            0x00, 0x00, 0x00, 0x1A, // length prefix = 26
-            0x9B, // fixarray, 11 elements
+            0x00, 0x00, 0x00, 0x1B, // length prefix = 27
+            0x9C, // fixarray, 12 elements
             0x05, // Type = ClientMessage (enum ordinal 5)
             0xA6, 0x63, 0x6F, 0x6E, 0x6E, 0x2D, 0x31, // "conn-1"
             0xC0, // HubName = nil
@@ -40,6 +41,7 @@ public class ServerEnvelopeSerializerTests
             0xC0, // Claims = nil
             0xC0, // Error = nil
             0xC0, // Version = nil
+            0xC0, // Payloads = nil
         ];
 
         Assert.Equal(expected, buffer.WrittenSpan.ToArray());

@@ -29,6 +29,9 @@ namespace Keryhe.Switchboard.Server
             builder.Services.AddSingleton<Keryhe.Switchboard.Protocol.IHubRegistry, Keryhe.Switchboard.Registry.InMemoryHubRegistry>();
             builder.Services.AddSingleton<Keryhe.Switchboard.Protocol.IServerConnectionSelector, Keryhe.Switchboard.Registry.RoundRobinServerConnectionSelector>();
             builder.Services.AddSingleton<Keryhe.Switchboard.Core.ILocalTransportRegistry, Keryhe.Switchboard.Registry.LocalTransportRegistry>();
+            builder.Services.AddSingleton<Keryhe.Switchboard.Server.ClientConnections.ClientConnectionManager>();
+            builder.Services.AddSingleton<Keryhe.Switchboard.Server.ClientConnections.LongPollingConnectionTracker>();
+            builder.Services.AddHostedService<Keryhe.Switchboard.Server.ClientConnections.LongPollingReaperService>();
             builder.Services.AddSingleton<Keryhe.Switchboard.Core.IBackplane, Keryhe.Switchboard.Registry.NoOpBackplane>();
             builder.Services.AddSingleton(TimeProvider.System);
             builder.Services.AddSingleton<Keryhe.Switchboard.Registry.IPendingConnectionStore, Keryhe.Switchboard.Registry.InMemoryPendingConnectionStore>();
@@ -64,7 +67,9 @@ namespace Keryhe.Switchboard.Server
 
             app.MapPost("/{hub}/negotiate", Keryhe.Switchboard.Server.Negotiate.NegotiateEndpoint.HandleAsync);
             app.MapGet("/server/{hub}", Keryhe.Switchboard.Server.ServerConnections.ServerConnectionEndpoint.HandleAsync);
-            app.MapGet("/{hub}", Keryhe.Switchboard.Server.ClientConnections.ClientConnectionEndpoint.HandleAsync);
+            app.MapGet("/{hub}", Keryhe.Switchboard.Server.ClientConnections.ClientEndpoints.HandleGetAsync);
+            app.MapPost("/{hub}", Keryhe.Switchboard.Server.ClientConnections.ClientEndpoints.HandlePostAsync);
+            app.MapDelete("/{hub}", Keryhe.Switchboard.Server.ClientConnections.ClientEndpoints.HandleDeleteAsync);
 
             return app;
         }

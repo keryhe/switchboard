@@ -4,15 +4,23 @@ using System.Net.WebSockets;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
 using Keryhe.Switchboard.Core;
-using Keryhe.Switchboard.Protocol;
+using Keryhe.Switchboard.Protocol.Framing;
+using Microsoft.AspNetCore.Connections;
 
 namespace Keryhe.Switchboard.Server.ClientConnections;
 
 /// <summary>
-/// WebSocket transport for a single client connection (03-protocol.md §1.2). Phase 1 is JSON
-/// hub-protocol only, so framing is the \x1e record separator (04-design.md §6, plan Slice 4).
+/// WebSocket transport for a single client connection (03-protocol.md §1.2). Frame boundaries and
+/// the WebSocket message type both follow <see cref="Framing"/> (04-design.md §6) — mutable
+/// because the handshake itself is always read as JSON (finding 1 — see
+/// docs/docs/09-phase0-findings/) regardless of which protocol the client eventually negotiates,
+/// so <see cref="ClientConnectionEndpoint"/> starts every connection at
+/// <see cref="JsonFraming.Instance"/> and switches this property once the handshake reveals the
+/// real protocol, before writing the handshake response (whose WebSocket frame type must already
+/// match the negotiated protocol's transfer format — a real MessagePack client sends even its
+/// JSON handshake request inside a Binary WebSocket frame).
 /// </summary>
-public sealed class WebSocketClientTransport : IClientTransport, IAsyncDisposable
+public sealed class WebSocketClientTransport : IFramedClientTransport, IAsyncDisposable
 {
     private readonly WebSocket _socket;
     private readonly Pipe _receivePipe = new();
@@ -37,6 +45,19 @@ public sealed class WebSocketClientTransport : IClientTransport, IAsyncDisposabl
     public string? UserId { get; }
     public Channel<ReadOnlyMemory<byte>> Output { get; }
 
+    /// <summary>Frame reader/writer for the negotiated hub protocol. Starts at
+    /// <see cref="JsonFraming.Instance"/> (the handshake's own fixed framing) and is switched by
+    /// the caller once the handshake request reveals the real protocol.</summary>
+    public IHubProtocolFraming Framing { get; set; } = JsonFraming.Instance;
+
+    public bool SupportsBinaryTransferFormat => true;
+
+    /// <summary>
+    /// Yields each frame <b>including its own framing</b> (the JSON record separator, or the
+    /// MessagePack length prefix) — this is exactly the server-facing <c>payload</c> contract
+    /// (04-design.md §11), so callers no longer need to re-apply framing before forwarding a
+    /// frame as a <c>client_message</c>.
+    /// </summary>
     public async IAsyncEnumerable<ReadOnlyMemory<byte>> ReadAllAsync([EnumeratorCancellation] CancellationToken ct)
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _cts.Token);
@@ -46,7 +67,7 @@ public sealed class WebSocketClientTransport : IClientTransport, IAsyncDisposabl
             var result = await _receivePipe.Reader.ReadAsync(linked.Token);
             var buffer = result.Buffer;
 
-            while (JsonFrameProtocol.TryParseFrame(ref buffer, out var frame))
+            while (Framing.TryReadFrame(ref buffer, out var frame))
             {
                 yield return frame.ToArray();
             }
@@ -127,7 +148,15 @@ public sealed class WebSocketClientTransport : IClientTransport, IAsyncDisposabl
                     break;
                 }
 
-                await _socket.SendAsync(frame, WebSocketMessageType.Text, endOfMessage: true, ct);
+                // The WebSocket message type follows the negotiated protocol's transfer format,
+                // not the content — verified against a real client: a MessagePack HubConnection
+                // sends its (always-JSON) handshake request inside a Binary frame, so the
+                // service's handshake *response* must go out as Binary too once the protocol is
+                // known (see the type-level doc comment above).
+                var messageType = Framing.TransferFormat == TransferFormat.Binary
+                    ? WebSocketMessageType.Binary
+                    : WebSocketMessageType.Text;
+                await _socket.SendAsync(frame, messageType, endOfMessage: true, ct);
             }
         }
         catch (Exception ex) when (ex is OperationCanceledException or WebSocketException)

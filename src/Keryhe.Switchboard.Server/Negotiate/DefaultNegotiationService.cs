@@ -55,8 +55,9 @@ public sealed class DefaultNegotiationService(
             claims.Count > 0 ? claims : null,
             DateTimeOffset.UtcNow.Add(_options.ClientTokenExpiry)));
 
-        // Phase 1 is WebSocket-only (see plan §4 Slice 4) — advertising SSE/LongPolling here would
-        // be false, since neither transport is implemented yet.
+        // All three transports are implemented (plan §4 Slices 4-6). SSE is Text-only since it
+        // cannot carry MessagePack's binary frames; Long Polling is plain request/response bodies
+        // and carries both, same as WebSocket.
         var response = new NegotiateResponse
         {
             ConnectionId = connectionId,
@@ -65,6 +66,8 @@ public sealed class DefaultNegotiationService(
             AvailableTransports =
             [
                 new AvailableTransport { Transport = "WebSockets", TransferFormats = ["Text", "Binary"] },
+                new AvailableTransport { Transport = "ServerSentEvents", TransferFormats = ["Text"] },
+                new AvailableTransport { Transport = "LongPolling", TransferFormats = ["Text", "Binary"] },
             ],
         };
 

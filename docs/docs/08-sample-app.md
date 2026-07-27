@@ -2,7 +2,7 @@
 
 The sample application is a real-time chat app that demonstrates the full end-to-end flow through the Switchboard. It is intentionally simple — the goal is to exercise every integration point, not to be a production chat product.
 
-> **Route correction (found during Phase 1 implementation):** this document's `/api/chatHub` illustration doesn't work — the service's own routes (`/{hub}/negotiate`, `/{hub}`, `/server/{hub}`) use a single-segment `{hub}` route parameter, which can't span multiple path segments. The real `SampleChatApp.Api` maps `ChatHub` at `/chatHub` instead. Treat every `/api/chatHub` reference below as `/chatHub`.
+`SampleChatApp.Api` maps `ChatHub` at the bare `/chatHub`, not `/api/chatHub` — the service's own routes (`/{hub}/negotiate`, `/{hub}`, `/server/{hub}`) use a single-segment `{hub}` route parameter, which can't span multiple path segments (found during Phase 1 implementation). Every `/chatHub` path below reflects that; only the REST endpoints genuinely under `/api` (`/api/auth/login`, `/api/rooms/{roomId}/system-message`) use that prefix. `SampleChatApp.Angular` exists as of Phase 2 (Slice 9) and this document has been verified against its actual, running implementation — not just against the API side, as in Phase 1.
 
 ---
 
@@ -27,7 +27,7 @@ graph LR
     end
 
     subgraph SampleChatApp.Api
-        NEG[/api/chatHub/negotiate]
+        NEG[/chatHub/negotiate]
         HUB[ChatHub]
         AUTH[Auth Middleware]
     end
@@ -36,7 +36,7 @@ graph LR
         PROXY[Proxy + Backplane]
     end
 
-    ANG -->|1. POST /api/chatHub/negotiate| AUTH
+    ANG -->|1. POST /chatHub/negotiate| AUTH
     AUTH --> NEG
     NEG -->|forward negotiate| PROXY
     PROXY -->|url + accessToken| NEG
@@ -52,7 +52,7 @@ graph LR
 ### Step 1 — Angular negotiates through the API
 
 ```
-POST https://localhost:5001/api/chatHub/negotiate
+POST http://localhost:5001/chatHub/negotiate
 Authorization: Bearer <user JWT from login>
 ```
 
@@ -123,7 +123,8 @@ SampleChatApp.Api/
 ├── Hubs/
 │   └── ChatHub.cs
 ├── Controllers/
-│   └── AuthController.cs         # POST /api/auth/login → issues user JWT
+│   ├── AuthController.cs         # POST /api/auth/login → issues user JWT
+│   └── RoomsController.cs        # POST /api/rooms/{roomId}/system-message → demo trigger for the SystemMessage push below (Phase 2)
 ├── Services/
 │   └── MessageService.cs         # Business logic; injects IHubContext<ChatHub>
 ├── Program.cs
@@ -155,7 +156,7 @@ var app = builder.Build();
 app.UseAuthentication();
 app.UseAuthorization();
 app.MapControllers();
-app.MapHub<ChatHub>("/api/chatHub");   // negotiate endpoint lives here
+app.MapHub<ChatHub>("/chatHub");   // negotiate endpoint lives here
 
 app.Run();
 ```
@@ -223,7 +224,7 @@ public class ChatHub : Hub
 | Connected confirmation | `OnConnectedAsync` → `Clients.Caller` | `Connected` |
 | Server push (no client trigger) | `MessageService` → `IHubContext` | `SystemMessage` |
 
-The `SystemMessage` event (sent via `IHubContext` from `MessageService`) demonstrates server-initiated push — a common pattern where something outside a hub method (a background job, a webhook handler, etc.) needs to push to clients.
+The `SystemMessage` event (sent via `IHubContext` from `MessageService`) demonstrates server-initiated push — a common pattern where something outside a hub method (a background job, a webhook handler, etc.) needs to push to clients. `RoomsController`'s `POST /api/rooms/{roomId}/system-message` is that "something outside a hub method" for the sample — a plain authenticated HTTP endpoint, not a hub method, exists purely to give this push path a way to actually fire when running the sample by hand.
 
 ---
 
@@ -281,7 +282,7 @@ export class ChatService {
 
   constructor(private auth: AuthService) {
     this.connection = new signalR.HubConnectionBuilder()
-      .withUrl('/api/chatHub', {
+      .withUrl('/chatHub', {
         // The API validates this token to extract userId before forwarding negotiate
         accessTokenFactory: () => this.auth.getAccessToken()
       })
@@ -356,7 +357,7 @@ Four URLs are in play, but Angular only needs to know one:
 
 | URL | Known by | Purpose |
 |---|---|---|
-| `https://localhost:5001/api/chatHub` | Angular | Negotiate endpoint (points at API) |
+| `http://localhost:5001/chatHub` | Angular | Negotiate endpoint (points at API) |
 | `https://localhost:7000` | API only | Proxy service — API connects here as app server |
 | `https://localhost:7000/chatHub` | Angular (auto, from redirect) | Redirect target — client re-negotiates here (step 2) |
 | `wss://localhost:7000/chatHub` | Angular (auto, derived) | Final WebSocket connection (scheme switched from the redirect `url`) |
@@ -370,24 +371,37 @@ Angular is configured with only the API URL. The proxy URL is an implementation 
 Running the sample locally requires three processes:
 
 ```
-Terminal 1:  dotnet run --project src/Keryhe.Switchboard.Server          # proxy on :7000
-Terminal 2:  dotnet run --project samples/SampleChatApp/SampleChatApp.Api   # API on :5001
-Terminal 3:  ng serve                                                  # Angular on :4200
+Terminal 1:  dotnet run --project src/Keryhe.Switchboard.Server --urls http://127.0.0.1:7000 -- --Switchboard:PublicUrl http://127.0.0.1:7000 --Switchboard:AllowedOrigins:0 http://localhost:4200
+Terminal 2:  dotnet run --project samples/SampleChatApp/SampleChatApp.Api --urls http://127.0.0.1:5001 -- --Switchboard:Url http://127.0.0.1:7000 --Switchboard:ServerToken <token from `token generate --role appserver`>
+Terminal 3:  cd samples/SampleChatApp/SampleChatApp.Angular && ng serve   # Angular on :4200
 ```
 
-Angular's `proxy.conf.json` proxies `/api` to the API during development:
+Plain `http`/`ws` (not `https`/`wss`) is what was actually verified end to end for local
+development — it avoids needing a trusted local dev TLS certificate on all three processes, and
+nothing here is exposed beyond localhost. Use `https`/`wss` (and drop `--secure: false` below) for
+any real deployment.
+
+Angular's `proxy.conf.json` proxies **both** `/api` (login, the `RoomsController` demo endpoint)
+and `/chatHub` to the API — they're separate prefixes on the real API, unlike the single `/api`
+prefix this document originally illustrated:
 
 ```json
 {
   "/api": {
-    "target": "https://localhost:5001",
+    "target": "http://localhost:5001",
     "secure": false,
     "changeOrigin": true
+  },
+  "/chatHub": {
+    "target": "http://localhost:5001",
+    "secure": false,
+    "changeOrigin": true,
+    "ws": true
   }
 }
 ```
 
-This means Angular always calls `/api/chatHub/negotiate` and the dev proxy forwards it — no CORS configuration needed in development.
+This means Angular always calls `/chatHub/negotiate` and the dev proxy forwards it — no CORS configuration needed in development. The actual `SampleChatApp.Angular/proxy.conf.json` proxies both `/api` (login, the `RoomsController` demo endpoint) and `/chatHub` to the API, since the two live under different path prefixes on the real API.
 
 ---
 

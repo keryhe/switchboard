@@ -105,16 +105,11 @@ public class MilestoneEndToEndTests : IAsyncLifetime
         await connection.InvokeAsync("JoinRoom", "room1").WaitAsync(TimeSpan.FromSeconds(10));
         await connection.InvokeAsync("SendMessage", "room1", "hello").WaitAsync(TimeSpan.FromSeconds(10));
 
-        // ChatHub.SendMessage fans out via Clients.Group(roomId), and group fan-out
-        // (DefaultMessageRouter.SendToGroupAsync) is a deliberate log-and-no-op in Phase 1 — real
-        // group routing is a Phase 2 deliverable (plan decision D3). So the message must NOT come
-        // back yet. Asserting the absence keeps the documented Phase 1 gap honest and makes this
-        // line fail loudly the moment Phase 2 lands, at which point it becomes the positive
-        // assertion that `received` carries text "hello".
-        var groupFanOut = await Task.WhenAny(received.Task, Task.Delay(TimeSpan.FromSeconds(2)));
-        Assert.False(
-            ReferenceEquals(groupFanOut, received.Task),
-            "Group fan-out delivered a message, but Phase 1 routes group sends nowhere (D3). Phase 2 has landed — turn this into a positive assertion.");
+        // ChatHub.SendMessage fans out via Clients.Group(roomId). Phase 1 routed group sends
+        // nowhere (plan decision D3, a deliberate log-and-no-op); Phase 2 Slice 1 implements real
+        // group fan-out, so the message the room's own member sent must now come back to it.
+        var message = await received.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal("hello", message.GetProperty("text").GetString());
 
         await connection.StopAsync().WaitAsync(TimeSpan.FromSeconds(10));
     }

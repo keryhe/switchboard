@@ -125,29 +125,31 @@ Both mechanisms confirmed with no fallback needed. 22 automated tests + a real o
 
 ---
 
-## Phase 2 — Full Transport & Protocol Support
+## Phase 2 — Full Transport & Protocol Support ✅ Complete (2026-07-27)
 
 **Goal:** Full SignalR transport and protocol compatibility. Existing apps need zero code changes beyond adding the connector package.
 
 **Deliverables:**
 
-- [ ] Server-Sent Events transport (read via POST, write via SSE stream)
-- [ ] Long Polling transport (GET to receive, POST to send, DELETE to close)
-- [ ] MessagePack hub protocol (frame reading/writing using length-prefix)
-- [ ] Protocol negotiation: client chooses json or messagepack in handshake
-- [ ] Group management: `add_to_group`, `remove_from_group`, group fan-out via `SendToGroupAsync`
-- [ ] User targeting: `send_to_user`, user connection index in registry
-- [ ] Streaming: `StreamInvocation` (client) and `StreamItem` / `Completion` sequence (server)
-- [ ] `CancelInvocation` handling
-- [ ] Hub-level `Ping` / `Close` message handling (distinct from transport-level keep-alive)
-- [ ] `Send` and `SendCore` variants (with and without invocation ID)
-- [ ] Excluded connection IDs in broadcast and group sends
-- [ ] CORS policy applied and verified for browser clients (preflight on negotiate, `Origin` header on WebSocket upgrade)
-- [ ] Pattern A (service-direct negotiate) — config + header handling, disabled by default: `EnableDirectNegotiate`, `TrustedIdentityHeader`, `TrustedClaimsHeader`, `TrustedProxyNetworks`; startup validation refuses to boot when enabled with an empty allowlist; identity headers stripped for non-allowlisted peers ([04-design.md §1](04-design.md)). Tests: allowlisted peer negotiates successfully; non-allowlisted peer asserting `X-Switchboard-UserId` is treated as anonymous, not trusted
-- [ ] Angular `SampleChatApp.Angular` wired up to `SampleChatApp.Api`; full negotiate-through-API flow verified in browser
-- [ ] Integration tests for each transport and protocol combination
+- [x] Server-Sent Events transport (read via POST, write via SSE stream)
+- [x] Long Polling transport (GET to receive, POST to send, DELETE to close)
+- [x] MessagePack hub protocol (frame reading/writing using length-prefix)
+- [x] Protocol negotiation: client chooses json or messagepack in handshake
+- [x] Group management: `add_to_group`, `remove_from_group`, group fan-out via `SendToGroupAsync`
+- [x] User targeting: `send_to_user`, user connection index in registry
+- [x] Streaming: `StreamInvocation` (client) and `StreamItem` / `Completion` sequence (server)
+- [x] `CancelInvocation` handling
+- [x] Hub-level `Ping` / `Close` message handling (distinct from transport-level keep-alive) — both directions: inbound client `Ping` absorbed (D13), and (Slice 9 fix) an outbound periodic keep-alive `Ping` the service actually sends, which the `ClientKeepAliveInterval` option had declared since Phase 1 but nothing wired up until a live browser session surfaced the gap
+- [x] `Send` and `SendCore` variants (with and without invocation ID)
+- [x] Excluded connection IDs in broadcast and group sends
+- [x] CORS policy applied and verified for browser clients (preflight on negotiate and the SSE/Long Polling POST/DELETE routes via the existing `app.UseCors` default policy; `Origin` on the WebSocket upgrade handled separately and explicitly, since CORS middleware does not apply to WS upgrades at all — confirmed, not assumed)
+- [x] Pattern A (service-direct negotiate) — config + header handling, disabled by default: `EnableDirectNegotiate`, `TrustedIdentityHeader`, `TrustedClaimsHeader`, `TrustedProxyNetworks`; startup validation refuses to boot when enabled with an empty allowlist; identity headers stripped for non-allowlisted peers ([04-design.md §1](04-design.md)). Tests: allowlisted peer negotiates successfully; non-allowlisted peer asserting `X-Switchboard-UserId` is treated as anonymous, not trusted
+- [x] Angular `SampleChatApp.Angular` wired up to `SampleChatApp.Api`; full negotiate-through-API flow verified in browser
+- [x] Integration tests for each transport and protocol combination
 
-**Milestone check:** `SampleChatApp.Angular` running in a browser negotiates through the API, opens a WebSocket to the proxy, and the full chat room flow (join, send, receive, leave) works. Standard .NET client also tested over all three transports.
+**Milestone check — passed.** `SampleChatApp.Angular` running in a real browser (manually verified, not just automated) negotiates through the API, opens a WebSocket to the proxy, and the full chat room flow (login, join, cross-client send/receive, `UserJoined`/`UserLeft`, a server-initiated `SystemMessage` push) works. The standard .NET client is green across all three transports × both hub protocols (`TransportProtocolMatrixEndToEndTests`, minus the one impossible SSE+MessagePack cell, which is pinned absent rather than silently skipped). 101 unit tests + 1 integration test pass. Full results: [00-review-findings.md § Phase 2 Slices 5-9](00-review-findings.md).
+
+**What Phase 3 inherits:** every fan-out path added in this phase (broadcast, group, user) is explicitly **node-local** — it goes through `ILocalTransportRegistry`, and `IBackplane` is still `NoOpBackplane`, completely untouched since Phase 1. Cross-node fan-out is entirely Phase 3's job. The transport abstraction (`IClientTransport` → `IFramedClientTransport` → `IPostableClientTransport`) and `ClientConnectionLifecycle` are transport-agnostic already, so Phase 3's reconnect support (`Close{allowReconnect:true}` on server-connection loss) can reuse them unchanged across all three transports rather than being a WebSocket-only concern.
 
 ---
 

@@ -102,6 +102,12 @@ Or with error:
 
 Supported protocols: `json` (version 1), `messagepack` (version 1).
 
+The handshake request and response are **always JSON**, regardless of which hub protocol is being
+negotiated — a MessagePack client sends its (JSON) handshake request inside a *binary* WebSocket
+frame, and receives a JSON handshake response the same way. Only the WebSocket frame *type* the
+handshake and every subsequent message travel in follows the negotiated protocol's transfer format
+(`Text` for `json`, `Binary` for `messagepack`) — the handshake bytes themselves never vary.
+
 ---
 
 ### 1.3 Message Framing
@@ -114,7 +120,11 @@ Messages are delimited by the ASCII record separator character `\x1e` (0x1E). A 
 ```
 
 **MessagePack Hub Protocol**  
-Messages are length-prefixed using the MessagePack variable-length integer encoding (VarInt). The length prefix is the byte length of the following MessagePack-encoded message array.
+Messages are length-prefixed using the same variable-length integer encoding SignalR's own
+MessagePack protocol uses: 7 bits of value per byte, **least-significant group first**, with the
+high bit of each byte set as a continuation flag (clear on the final byte). The prefix's decoded
+value is the byte length of the following MessagePack-encoded message array. A single WebSocket
+binary frame may contain multiple length-prefixed messages back to back.
 
 ---
 
@@ -179,7 +189,12 @@ GET /{hubName}?id={connectionToken}&access_token={JWT}
 Accept: text/event-stream
 ```
 
-Service streams events:
+The service must flush the response headers to the socket explicitly (`FlushAsync` after starting
+the response) rather than relying on the framework to do it implicitly — the real client's
+transport blocks on `HttpCompletionOption.ResponseHeadersRead` and hangs indefinitely if headers
+are only logically committed but never actually written to the wire.
+
+Service streams events, one hub message's raw bytes per `data:` line:
 ```
 data: {"type":6}\x1e
 
@@ -195,6 +210,11 @@ Content-Type: application/json; charset=utf-8
 {"type":1,"invocationId":"2","target":"SendMessage","arguments":["hello"]}\x1e
 ```
 
+SSE is **Text-only** — negotiate advertises `ServerSentEvents` with `transferFormats: ["Text"]`,
+never `Binary`, so a client cannot negotiate `messagepack` over this transport (handshake
+negotiation rejects it explicitly rather than silently corrupting binary data through a
+text-oriented stream). Use WebSocket or Long Polling for MessagePack.
+
 ---
 
 ### 1.6 Long Polling Transport
@@ -203,7 +223,18 @@ Content-Type: application/json; charset=utf-8
 ```
 GET /{hubName}?id={connectionToken}&access_token={JWT}
 ```
-Response: 200 with accumulated messages, or 204 No Content after timeout.
+Response: **200** with accumulated messages if any arrived, or **200 with an empty body** if the poll
+simply timed out with nothing to report — the real client's own long-polling transport treats
+*any* `204` as "this connection is over" and stops polling for good, so a plain idle timeout must
+never produce one (verified against the real `Microsoft.AspNetCore.Http.Connections.Client`/
+`Microsoft.AspNetCore.Http.Connections` implementations; see
+[00-review-findings.md § Phase 2 Slices 5-6](00-review-findings.md)). **204 No Content** is
+reserved for when the connection has actually ended (DELETE received, or the service's own idle
+reaper gave up on it after `DisconnectTimeout`) and there's nothing left buffered to return. The
+very first GET for a given `connectionToken` is special: it establishes the connection and returns
+immediately (empty 200), before any handshake or message has happened yet — the real client's
+`LongPollingTransport.StartAsync` only checks for a success status on this call and never reads
+its body.
 
 **Send (client sends messages):**
 ```
@@ -374,36 +405,50 @@ There is no `open_connection` acknowledgement: a connection is assumed accepted 
   "payload": "<raw hub-protocol message bytes>"
 }
 ```
+A targeted send has exactly one recipient, whose negotiated protocol the service already knows —
+so `send_to_connection` only ever carries a single `payload` encoded for that recipient. It never
+carries `payloads` (see below); there is nothing mixed-protocol about a single connection.
 
-**App Server → Service (broadcast to all clients in hub):**
+**App Server → Service (broadcast to all clients in hub / send to group / send to user — mixed-protocol fan-out, `[Key(11)] payloads`):**
+
+`broadcast`, `send_to_group`, and `send_to_user` can each fan out to a mix of `json` and
+`messagepack` recipients, and the app server doesn't know each recipient's protocol in advance. Per
+`[Key(11)] payloads` on `ServerEnvelope` — a `Dictionary<string, byte[]>` keyed by protocol name
+(`"json"` / `"messagepack"`) — the Connector always populates **both** encodings, and the service's
+router picks whichever entry matches each recipient's own negotiated protocol. `payload` /
+`hubProtocol` (singular) are still set alongside `payloads`, holding the `"json"` encoding, purely
+so an envelope inspected without `payloads`-awareness (e.g. an older reader) still gets something
+usable — the router itself always prefers `payloads` when present.
 ```json
 {
   "type": "broadcast",
   "hubName": "chatHub",
   "hubProtocol": "json",
-  "payload": "<raw hub-protocol message bytes>",
+  "payload": "<raw json-encoded hub-protocol message bytes>",
+  "payloads": {
+    "json": "<raw json-encoded hub-protocol message bytes>",
+    "messagepack": "<raw messagepack-encoded hub-protocol message bytes>"
+  },
   "excludedConnectionIds": []
 }
 ```
-
-**App Server → Service (send to group):**
 ```json
 {
   "type": "send_to_group",
   "groupName": "room-42",
   "hubProtocol": "json",
-  "payload": "<raw hub-protocol message bytes>",
+  "payload": "<raw json-encoded hub-protocol message bytes>",
+  "payloads": { "json": "<...>", "messagepack": "<...>" },
   "excludedConnectionIds": []
 }
 ```
-
-**App Server → Service (send to user):**
 ```json
 {
   "type": "send_to_user",
   "userId": "alice",
   "hubProtocol": "json",
-  "payload": "<raw hub-protocol message bytes>"
+  "payload": "<raw json-encoded hub-protocol message bytes>",
+  "payloads": { "json": "<...>", "messagepack": "<...>" }
 }
 ```
 

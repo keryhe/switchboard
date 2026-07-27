@@ -16,9 +16,17 @@ namespace Keryhe.Switchboard.Connector.Dispatch;
 /// </summary>
 public sealed class InboundDispatcher(HubPipelineFactory pipelineFactory, ILogger<InboundDispatcher> logger)
 {
-    private static readonly IHubProtocol JsonProtocol = new JsonHubProtocol();
-
     private readonly ConcurrentDictionary<string, ConnectionEntry> _connections = new();
+
+    /// <summary>
+    /// The negotiated protocol for a live connection, or null if unknown (already closed, or
+    /// never opened here). Consulted by <see cref="SwitchboardHubLifetimeManager{THub}"/> for
+    /// single-target sends (<c>Clients.Client</c>/<c>Clients.Caller</c>), which — unlike fan-out —
+    /// know exactly which connection they're addressing, so they can build one correctly-encoded
+    /// payload instead of the fan-out <c>Payloads</c> set (plan decision D7).
+    /// </summary>
+    public string? GetHubProtocol(string connectionId) =>
+        _connections.TryGetValue(connectionId, out var entry) ? entry.HubProtocol : null;
 
     public async Task HandleAsync(Type hubType, string hubName, ServerEnvelope envelope, Func<ServerEnvelope, CancellationToken, Task> sendToService, CancellationToken ct)
     {
@@ -58,10 +66,10 @@ public sealed class InboundDispatcher(HubPipelineFactory pipelineFactory, ILogge
 
         await HandshakeWriter.WriteHandshakeRequestAsync(context.ToHubWriter, hubProtocol);
 
-        var entry = new ConnectionEntry(context, pipelineTask);
+        var entry = new ConnectionEntry(context, pipelineTask, hubProtocol);
         _connections[connectionId] = entry;
 
-        entry.OutboundReaderTask = RunOutboundReaderAsync(connectionId, context, sendToService, ct);
+        entry.OutboundReaderTask = RunOutboundReaderAsync(connectionId, hubProtocol, context, sendToService, ct);
     }
 
     private async Task FeedClientMessageAsync(ServerEnvelope envelope, CancellationToken ct)
@@ -100,8 +108,9 @@ public sealed class InboundDispatcher(HubPipelineFactory pipelineFactory, ILogge
     /// 04-design.md §11 "Outbound from the pipeline". Detects pipeline completion (rejection path:
     /// OnConnectedAsync threw) and reports it back as close_connection.
     /// </summary>
-    private async Task RunOutboundReaderAsync(string connectionId, SwitchboardClientConnectionContext context, Func<ServerEnvelope, CancellationToken, Task> sendToService, CancellationToken ct)
+    private async Task RunOutboundReaderAsync(string connectionId, string hubProtocol, SwitchboardClientConnectionContext context, Func<ServerEnvelope, CancellationToken, Task> sendToService, CancellationToken ct)
     {
+        var protocol = ResolveProtocol(hubProtocol);
         var reader = context.FromHubReader;
         var handshakeConsumed = false;
         string? rejectionError = null;
@@ -133,8 +142,23 @@ public sealed class InboundDispatcher(HubPipelineFactory pipelineFactory, ILogge
                     }
                 }
 
-                while (JsonProtocol.TryParseMessage(ref buffer, EmptyBinder.Instance, out var message))
+                // Parse only to classify (drop the pipeline's own Ping, detect Close) — never to
+                // re-encode. Re-serializing a message parsed with EmptyBinder is lossy in the
+                // general case (finding 7, plan decision D12): its GetReturnType/GetStreamItemType
+                // return typeof(object), so MessagePack arguments round-trip through loosely-typed
+                // CLR objects that don't reconstruct to the same bytes. Forwarding the exact
+                // consumed bytes — the prefix before TryParseMessage minus whatever it left behind
+                // — sidesteps the round trip entirely, for both protocols.
+                while (true)
                 {
+                    var before = buffer;
+                    if (!protocol.TryParseMessage(ref buffer, EmptyBinder.Instance, out var message))
+                    {
+                        break;
+                    }
+
+                    var consumed = before.Slice(0, before.Length - buffer.Length);
+
                     switch (message)
                     {
                         case PingMessage:
@@ -145,14 +169,12 @@ public sealed class InboundDispatcher(HubPipelineFactory pipelineFactory, ILogge
                             break;
 
                         default:
-                            var frame = new System.Buffers.ArrayBufferWriter<byte>();
-                            JsonProtocol.WriteMessage(message, frame);
                             await sendToService(new ServerEnvelope
                             {
                                 Type = ServerEnvelopeType.SendToConnection,
                                 ConnectionId = connectionId,
-                                HubProtocol = "json",
-                                Payload = frame.WrittenMemory.ToArray(),
+                                HubProtocol = hubProtocol,
+                                Payload = consumed.ToArray(),
                             }, ct);
                             break;
                     }
@@ -183,10 +205,20 @@ public sealed class InboundDispatcher(HubPipelineFactory pipelineFactory, ILogge
         }
     }
 
-    private sealed class ConnectionEntry(SwitchboardClientConnectionContext context, Task pipelineTask)
+    private static IHubProtocol ResolveProtocol(string hubProtocol) => hubProtocol switch
+    {
+        "messagepack" => MessagePackProtocol,
+        _ => JsonProtocol,
+    };
+
+    private static readonly IHubProtocol JsonProtocol = new JsonHubProtocol();
+    private static readonly IHubProtocol MessagePackProtocol = new MessagePackHubProtocol();
+
+    private sealed class ConnectionEntry(SwitchboardClientConnectionContext context, Task pipelineTask, string hubProtocol)
     {
         public SwitchboardClientConnectionContext Context { get; } = context;
         public Task PipelineTask { get; } = pipelineTask;
+        public string HubProtocol { get; } = hubProtocol;
         public Task? OutboundReaderTask { get; set; }
     }
 

@@ -108,6 +108,106 @@ public class ClientRouterEndToEndTests : IAsyncLifetime
         Assert.Equal("broadcast-hello", text2);
     }
 
+    [Fact]
+    public async Task SendToGroup_ReachesMembers_ExcludesExcludedConnection_AndSurvivesUnrelatedDisconnect()
+    {
+        var tokenService = _factory.Services.GetRequiredService<ITokenService>();
+        var serverToken = tokenService.IssueServerToken("test-server", [HubName], TimeSpan.FromHours(1));
+
+        await using var appServerDouble = await AppServerDouble.ConnectAsync(_factory.ServerAddress, HubName, serverToken);
+
+        var tokenA = tokenService.IssueClientToken(Guid.NewGuid().ToString("n"), HubName, "member-a", null, TimeSpan.FromMinutes(1));
+        var tokenB = tokenService.IssueClientToken(Guid.NewGuid().ToString("n"), HubName, "member-b", null, TimeSpan.FromMinutes(1));
+        var tokenExcluded = tokenService.IssueClientToken(Guid.NewGuid().ToString("n"), HubName, "excluded", null, TimeSpan.FromMinutes(1));
+        var tokenUnrelated = tokenService.IssueClientToken(Guid.NewGuid().ToString("n"), HubName, "unrelated", null, TimeSpan.FromMinutes(1));
+
+        await using var clientA = BuildClient(tokenA);
+        await using var clientB = BuildClient(tokenB);
+        await using var clientExcluded = BuildClient(tokenExcluded);
+        var clientUnrelated = BuildClient(tokenUnrelated);
+
+        var receivedA = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var receivedB = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var receivedExcluded = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        clientA.On<string, string>("ReceiveMessage", (_, text) => receivedA.SetResult(text));
+        clientB.On<string, string>("ReceiveMessage", (_, text) => receivedB.SetResult(text));
+        clientExcluded.On<string, string>("ReceiveMessage", (_, text) => receivedExcluded.SetResult(text));
+
+        await clientA.StartAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        var connectionIdA = (await appServerDouble.ReceiveEnvelopeAsync(ServerEnvelopeType.OpenConnection, TimeSpan.FromSeconds(5))).ConnectionId!;
+
+        await clientB.StartAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        var connectionIdB = (await appServerDouble.ReceiveEnvelopeAsync(ServerEnvelopeType.OpenConnection, TimeSpan.FromSeconds(5))).ConnectionId!;
+
+        await clientExcluded.StartAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        var connectionIdExcluded = (await appServerDouble.ReceiveEnvelopeAsync(ServerEnvelopeType.OpenConnection, TimeSpan.FromSeconds(5))).ConnectionId!;
+
+        await clientUnrelated.StartAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        await appServerDouble.ReceiveEnvelopeAsync(ServerEnvelopeType.OpenConnection, TimeSpan.FromSeconds(5)); // for the unrelated connection
+
+        const string room = "room-42";
+        await appServerDouble.AddToGroupAsync(connectionIdA, room);
+        await appServerDouble.AddToGroupAsync(connectionIdB, room);
+        await appServerDouble.AddToGroupAsync(connectionIdExcluded, room);
+
+        // An unrelated connection (never joined the group) disconnects — group membership for the
+        // real members must not be disturbed by cleanup of an unrelated connection.
+        await clientUnrelated.DisposeAsync();
+        await appServerDouble.ReceiveEnvelopeAsync(ServerEnvelopeType.CloseConnection, TimeSpan.FromSeconds(5)); // for the unrelated connection
+
+        await appServerDouble.SendToGroupAsync(HubName, room, "ReceiveMessage", [connectionIdExcluded], "System", "room-hello");
+
+        var textA = await receivedA.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var textB = await receivedB.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("room-hello", textA);
+        Assert.Equal("room-hello", textB);
+
+        var excludedGotIt = await Task.WhenAny(receivedExcluded.Task, Task.Delay(TimeSpan.FromSeconds(2)));
+        Assert.False(ReferenceEquals(excludedGotIt, receivedExcluded.Task), "excluded connection should not have received the group send");
+    }
+
+    [Fact]
+    public async Task SendToUser_ReachesAllOfThatUsersConnections_AndNoOthers()
+    {
+        var tokenService = _factory.Services.GetRequiredService<ITokenService>();
+        var serverToken = tokenService.IssueServerToken("test-server", [HubName], TimeSpan.FromHours(1));
+
+        await using var appServerDouble = await AppServerDouble.ConnectAsync(_factory.ServerAddress, HubName, serverToken);
+
+        // Two connections for the same user (e.g. two browser tabs), one connection for another user.
+        var tokenDave1 = tokenService.IssueClientToken(Guid.NewGuid().ToString("n"), HubName, "dave", null, TimeSpan.FromMinutes(1));
+        var tokenDave2 = tokenService.IssueClientToken(Guid.NewGuid().ToString("n"), HubName, "dave", null, TimeSpan.FromMinutes(1));
+        var tokenEve = tokenService.IssueClientToken(Guid.NewGuid().ToString("n"), HubName, "eve", null, TimeSpan.FromMinutes(1));
+
+        await using var dave1 = BuildClient(tokenDave1);
+        await using var dave2 = BuildClient(tokenDave2);
+        await using var eve = BuildClient(tokenEve);
+
+        var receivedDave1 = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var receivedDave2 = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var receivedEve = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        dave1.On<string, string>("ReceiveMessage", (_, text) => receivedDave1.SetResult(text));
+        dave2.On<string, string>("ReceiveMessage", (_, text) => receivedDave2.SetResult(text));
+        eve.On<string, string>("ReceiveMessage", (_, text) => receivedEve.SetResult(text));
+
+        await dave1.StartAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        await appServerDouble.ReceiveEnvelopeAsync(ServerEnvelopeType.OpenConnection, TimeSpan.FromSeconds(5));
+        await dave2.StartAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        await appServerDouble.ReceiveEnvelopeAsync(ServerEnvelopeType.OpenConnection, TimeSpan.FromSeconds(5));
+        await eve.StartAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        await appServerDouble.ReceiveEnvelopeAsync(ServerEnvelopeType.OpenConnection, TimeSpan.FromSeconds(5));
+
+        await appServerDouble.SendToUserAsync(HubName, "dave", "ReceiveMessage", "System", "user-hello");
+
+        var textDave1 = await receivedDave1.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var textDave2 = await receivedDave2.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("user-hello", textDave1);
+        Assert.Equal("user-hello", textDave2);
+
+        var eveGotIt = await Task.WhenAny(receivedEve.Task, Task.Delay(TimeSpan.FromSeconds(2)));
+        Assert.False(ReferenceEquals(eveGotIt, receivedEve.Task), "a different user's connection should not receive Clients.User(dave)'s message");
+    }
+
     private HubConnection BuildClient(string clientToken)
     {
         var url = new Uri(_factory.ServerAddress, $"/{HubName}");
@@ -120,101 +220,4 @@ public class ClientRouterEndToEndTests : IAsyncLifetime
             .Build();
     }
 
-    /// <summary>Hand-rolled stand-in for the real Connector's server connection (Slice 5).</summary>
-    private sealed class AppServerDouble : IAsyncDisposable
-    {
-        private readonly ClientWebSocket _socket;
-
-        private AppServerDouble(ClientWebSocket socket) => _socket = socket;
-
-        public static async Task<AppServerDouble> ConnectAsync(Uri baseAddress, string hubName, string serverToken)
-        {
-            var socket = new ClientWebSocket();
-            socket.Options.SetRequestHeader("Authorization", $"Bearer {serverToken}");
-
-            var wsUri = new UriBuilder(baseAddress) { Scheme = "ws", Port = baseAddress.Port, Path = $"/server/{hubName}" }.Uri;
-            await socket.ConnectAsync(wsUri, CancellationToken.None);
-
-            var self = new AppServerDouble(socket);
-            await self.SendAsync(new ServerEnvelope { Type = ServerEnvelopeType.Handshake, HubName = hubName, Version = 1 });
-            var ack = await self.ReceiveAsync(TimeSpan.FromSeconds(5));
-            if (ack.Type != ServerEnvelopeType.HandshakeAck)
-            {
-                throw new InvalidOperationException($"Expected HandshakeAck, got {ack.Type}: {ack.Error}");
-            }
-
-            return self;
-        }
-
-        public async Task SendToConnectionAsync(string connectionId, string target, params object[] args)
-        {
-            await SendAsync(new ServerEnvelope
-            {
-                Type = ServerEnvelopeType.SendToConnection,
-                ConnectionId = connectionId,
-                HubProtocol = "json",
-                Payload = BuildInvocationFrame(target, args),
-            });
-        }
-
-        public async Task BroadcastAsync(string hubName, string target, params object[] args)
-        {
-            await SendAsync(new ServerEnvelope
-            {
-                Type = ServerEnvelopeType.Broadcast,
-                HubName = hubName,
-                HubProtocol = "json",
-                Payload = BuildInvocationFrame(target, args),
-            });
-        }
-
-        private static byte[] BuildInvocationFrame(string target, object[] args)
-        {
-            var json = System.Text.Json.JsonSerializer.Serialize(new { type = 1, target, arguments = args });
-            var writer = new System.Buffers.ArrayBufferWriter<byte>();
-            JsonFrameProtocol.WriteFrame(writer, Encoding.UTF8.GetBytes(json));
-            return writer.WrittenMemory.ToArray();
-        }
-
-        private async Task SendAsync(ServerEnvelope envelope)
-        {
-            var writer = new System.Buffers.ArrayBufferWriter<byte>();
-            ServerEnvelopeSerializer.Write(writer, envelope);
-            await _socket.SendAsync(writer.WrittenMemory, WebSocketMessageType.Binary, endOfMessage: true, CancellationToken.None);
-        }
-
-        public async Task<ServerEnvelope> ReceiveAsync(TimeSpan timeout)
-        {
-            using var cts = new CancellationTokenSource(timeout);
-            var buffer = new byte[16 * 1024];
-            var totalRead = 0;
-
-            while (true)
-            {
-                var result = await _socket.ReceiveAsync(buffer.AsMemory(totalRead), cts.Token);
-                totalRead += result.Count;
-
-                if (ServerEnvelopeSerializer.TryParseEnvelope(
-                        new System.Buffers.ReadOnlySequence<byte>(buffer.AsMemory(0, totalRead)),
-                        out var envelope, out _, out _))
-                {
-                    return envelope!;
-                }
-            }
-        }
-
-        public async ValueTask DisposeAsync()
-        {
-            try
-            {
-                await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
-            }
-            catch
-            {
-                // best-effort
-            }
-
-            _socket.Dispose();
-        }
-    }
 }

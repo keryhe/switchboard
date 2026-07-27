@@ -136,6 +136,9 @@ public sealed class ServerEnvelope
 
     [Key(10)]
     public int? Version { get; init; }               // handshake protocol version (§2.2); added during Phase 1 implementation, additive — never reuse or reorder Key(0..9)
+
+    [Key(11)]
+    public IReadOnlyDictionary<string, byte[]>? Payloads { get; init; }   // mixed-protocol fan-out (plan decision D7, Phase 2 Slice 3) — keyed by hub protocol name ("json"/"messagepack"); set on broadcast/send_to_group/send_to_user, never on send_to_connection (single known recipient protocol — see 03-protocol.md §2.3). Additive Key(11) — never reuse or reorder Key(0..10).
 }
 
 public enum ServerEnvelopeType
@@ -289,9 +292,22 @@ public sealed class SwitchboardOptions
     public TimeSpan ServerPingTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     // --- Client connections ---
+    // Drives the periodic hub-level Ping the service sends every client (04-design.md §2 Message
+    // Loop) — declared since Phase 1 but not actually wired to anything until Phase 2 Slice 9,
+    // when a real browser session sitting idle past the real client's 30s default ServerTimeout
+    // surfaced the gap (a silent reconnect loop, never caught by any sub-second automated test).
     public TimeSpan ClientKeepAliveInterval { get; set; } = TimeSpan.FromSeconds(15);
     public TimeSpan ClientHandshakeTimeout { get; set; } = TimeSpan.FromSeconds(5);
     public int MaxClientConnectionsPerHub { get; set; } = 0;   // 0 = unlimited
+
+    // --- SSE / Long Polling (Phase 2 Slices 5/6) ---
+    // WebSocket has a real socket-close event and needs neither of these. A Long Polling
+    // connection with no in-flight poll for this long is presumed gone (enforced by a background
+    // LongPollingReaperService, since there's no socket to notice the drop); a long-poll GET waits
+    // this long for a message to arrive before returning 200/empty (never 204 — see 03-protocol.md
+    // §1.6). Defaults match ASP.NET Core's own HttpConnectionDispatcherOptions.
+    public TimeSpan DisconnectTimeout { get; set; } = TimeSpan.FromSeconds(15);
+    public TimeSpan LongPollTimeout { get; set; } = TimeSpan.FromSeconds(90);
 
     // --- Write channel ---
     public int WriteChannelCapacity { get; set; } = 256;
