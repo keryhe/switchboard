@@ -133,6 +133,9 @@ public sealed class ServerEnvelope
 
     [Key(9)]
     public string? Error { get; init; }
+
+    [Key(10)]
+    public int? Version { get; init; }               // handshake protocol version (§2.2); added during Phase 1 implementation, additive — never reuse or reorder Key(0..9)
 }
 
 public enum ServerEnvelopeType
@@ -200,6 +203,8 @@ public sealed class AvailableTransport
     public required IReadOnlyList<string> TransferFormats { get; init; }  // "Text" | "Binary"
 }
 ```
+
+> **Step 2 wire serialization (Phase 1, resolved).** `Microsoft.AspNetCore.Http.Connections.NegotiateProtocol` is public (in `Http.Connections.Common.dll`) and its `NegotiationResponse` type already carries exactly the fields step 2 needs, serializing to precisely the shape this section specifies. The service uses `NegotiateProtocol.WriteResponse` directly for step 2 rather than hand-serializing `NegotiateResponse`/`AvailableTransport` above — free wire compatibility with the framework's own client-side parser. The redirect (step 1) response stays hand-written as `RedirectResponse`, because `NegotiationResponse`'s own JSON output for a redirect-shaped payload carries two extra fields (`negotiateVersion`, `availableTransports: []`) that §1.1 says a redirect must not have.
 
 ---
 

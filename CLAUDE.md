@@ -4,11 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**Phase 0 (Connector Mechanism Spike) is complete.** Both unproven Connector mechanisms — negotiate interception and inbound dispatch over a synthetic connection — are confirmed working against .NET 10, with no fallback needed. 22 automated tests pass plus a real out-of-process `@microsoft/signalr` client check. Full results: [docs/docs/00-review-findings.md § Phase 0 Spike Results](docs/docs/00-review-findings.md#phase-0-spike-results-2026-07-26), [spike/findings/](spike/findings/).
+**Phase 0 (Connector Mechanism Spike) is complete.** Both unproven Connector mechanisms — negotiate interception and inbound dispatch over a synthetic connection — are confirmed working against .NET 10, with no fallback needed. 22 automated tests pass plus a real out-of-process `@microsoft/signalr` client check. Full results: [docs/docs/00-review-findings.md § Phase 0 Spike Results](docs/docs/00-review-findings.md#phase-0-spike-results-2026-07-26), [docs/docs/09-phase0-findings/](docs/docs/09-phase0-findings/).
 
-Two real design-doc defects were found and fixed by tests that exercised the design doc's own claims rather than by review — see [spike/findings/inbound-dispatch-corrections.md](spike/findings/inbound-dispatch-corrections.md) and the corresponding corrections already applied to [docs/docs/04-design.md §11](docs/docs/04-design.md#11-connector--inbound-dispatch-synthetic-client-connections).
+Two real design-doc defects were found and fixed by tests that exercised the design doc's own claims rather than by review — see [docs/docs/09-phase0-findings/inbound-dispatch-corrections.md](docs/docs/09-phase0-findings/inbound-dispatch-corrections.md) and the corresponding corrections already applied to [docs/docs/04-design.md §11](docs/docs/04-design.md#11-connector--inbound-dispatch-synthetic-client-connections).
 
-**Phase 1 (Core Service MVP) has not started.** There is still no `Switchboard.sln`, no `src/`, no `tests/` — only `spike/` (Phase 0's throwaway host + the carry-forward Connector skeleton) and `docs/`/`plans/`. Phase 1 promotes `spike/Phase0.Spike.Connector/*` into the real `Keryhe.Switchboard.Connector` project (swapping the stub redirect target for the real proxy-forwarding call) and retires `spike/Phase0.Spike.Host`. See [docs/docs/06-project-plan.md § Phase 1](docs/docs/06-project-plan.md).
+**Phase 1 (Core Service MVP) is complete and the milestone is green.** `Switchboard.sln` holds all `src/` projects (`Core`, `Protocol`, `Registry`, `Server`, `Connector`), both `tests/` projects, and `samples/SampleChatApp/SampleChatApp.Api`. 32 unit tests + the out-of-process milestone integration test all pass, no skips. Full results: [docs/docs/00-review-findings.md § Phase 1 Results](docs/docs/00-review-findings.md).
+
+The one bug that held up the milestone is worth knowing about, because the same mistake is easy to repeat: the service was **stripping the `\x1e` record separator** from `client_message` payloads. `JsonFrameProtocol.TryParseFrame` yields frames with the delimiter removed (correct for a frame reader), but the server-facing `payload` contract is raw hub-protocol bytes **including framing** — the Connector writes `payload` verbatim into the synthetic connection's pipe, where `IHubProtocol.TryParseMessage` needs the terminator to see a complete message. Without it the bytes sat unparsed forever: no dispatch, no exception, just a client-side timeout. **If you touch either side of that boundary, preserve the framing** — `ClientConnectionEndpoint.FrameForServer` is where it's re-applied, and the outbound direction is already framed because `IHubProtocol.WriteMessage` emits the delimiter itself.
+
+**`spike/` has been retired.** Its verified framework findings live on at [docs/docs/09-phase0-findings/](docs/docs/09-phase0-findings/), and the `@microsoft/signalr` redirect-check script is parked at `samples/SampleChatApp/js-redirect-check/` for Phase 2 (it still targets the removed spike host and needs retargeting — see its README). The spike projects themselves are recoverable from git history at commit `b7456b2`.
 
 > **Update this file after each phase completes.** When a phase (Phase 0, Phase 1, ...) is finished, revise "Project Status" to name the new current phase, and update any other section here that the completed phase changed (solution layout once scaffolded, architecture notes if implementation diverged from the design docs, etc.).
 
@@ -23,32 +27,21 @@ Full rationale and comparison to Redis-backplane/Azure SignalR Service alternati
 
 ## Commands
 
-Phase 1's `Switchboard.sln` doesn't exist yet — the commands below are the expected shape once it's scaffolded (per the project plan):
-
 ```bash
 dotnet build Switchboard.sln
-dotnet test tests/Keryhe.Switchboard.UnitTests
-dotnet test tests/Keryhe.Switchboard.IntegrationTests
-dotnet test --filter "FullyQualifiedName~SomeTestClass.SomeTestMethod"   # single test
+dotnet test tests/Keryhe.Switchboard.UnitTests/Keryhe.Switchboard.UnitTests.csproj
+dotnet test tests/Keryhe.Switchboard.IntegrationTests/Keryhe.Switchboard.IntegrationTests.csproj
+dotnet test tests/Keryhe.Switchboard.UnitTests/Keryhe.Switchboard.UnitTests.csproj --filter "FullyQualifiedName~SomeTestClass.SomeTestMethod"   # single test
+
+# Generate a server or management access token (CLI mode of the Server host — see Cli/TokenCommand.cs):
+dotnet run --project src/Keryhe.Switchboard.Server --no-build -- token generate --role appserver --server-id chat-api-1 --hubs chatHub --ttl 24h --key <ServerSigningKey>
 ```
 
-The Phase 0 spike solution is real and working today:
-
-```bash
-dotnet build spike/Phase0.Spike.slnx
-dotnet test spike/Phase0.Spike.Tests/Phase0.Spike.Tests.csproj                              # all 22 tests
-dotnet test spike/Phase0.Spike.Tests/Phase0.Spike.Tests.csproj --filter "FullyQualifiedName~SomeTestClass.SomeTestMethod"   # single test
-
-# JS-client redirect check (A5) — needs the host running separately first:
-dotnet run --project spike/Phase0.Spike.Host --no-build --urls http://localhost:5559 &
-node spike/Phase0.Spike.JsClient/redirect-check.mjs http://localhost:5559
-```
-
-Note: the A5 `.NET`-client test (`DotNetClientEndToEndTests`) spawns `Phase0.Spike.Host.dll` as a real out-of-process Kestrel server on port 5559 — build the solution first (`dotnet build`) so that assembly exists before running the full test suite.
+Note: the milestone integration test spawns `Keryhe.Switchboard.Server.dll` and `SampleChatApp.Api.dll` as **real out-of-process Kestrel servers** (`tests/Keryhe.Switchboard.IntegrationTests/ProcessFixture.cs`), so build the solution first or it will fail on a missing assembly. Several unit tests likewise boot a real Kestrel host (`TestSupport/RealKestrelServerFixture.cs`) rather than `WebApplicationFactory`, because `TestServer`'s in-memory transport cannot do real WebSocket upgrades — a real `HubConnection` needs a real socket.
 
 There is no linter configured in the repo yet — do not invent one.
 
-## Architecture (target design — not yet implemented)
+## Architecture (Phase 1 implemented)
 
 ### Two-hop negotiate, then a persistent client transport
 
@@ -67,7 +60,7 @@ App servers never see real client connections. `Keryhe.Switchboard.Connector` (a
 - **Outbound divert (negotiate interception):** `MapHub<T>()` handles negotiate inline in the framework with no DI seam. The Connector registers a `MatcherPolicy` + `IEndpointSelectorPolicy` that detects the negotiate endpoint and replaces its `RequestDelegate` with one that returns Switchboard's redirect — while preserving the original endpoint's `Metadata` (this is the *only* way class-level `[Authorize]` on a Hub survives, since `DefaultHubDispatcher` doesn't enforce it). See [docs/docs/04-design.md §8](docs/docs/04-design.md).
 - **Inbound dispatch (synthetic connections):** since there's no real `ConnectionContext` for app-server-side clients, the Connector builds `HubConnectionHandler<THub>` via `ConnectionBuilder` once per hub type, then drives it per logical client with a synthetic `ConnectionContext` backed by a `Pipe` pair (`SwitchboardClientConnectionContext`). Identity flows in only through `IConnectionUserFeature`. `Context.GetHttpContext()` is always `null` on these synthetic connections — a documented, permanent incompatibility. See [docs/docs/04-design.md §11](docs/docs/04-design.md).
 
-Both mechanisms were "designed against framework internals rather than exercised in code" — that's why Phase 0 existed before Phase 1 was planned, and both are now confirmed working in `spike/Phase0.Spike.Connector/` with no fallback needed. See [docs/docs/00-review-findings.md](docs/docs/00-review-findings.md) for the history (a previous DI-override approach to negotiate interception turned out to be a silent no-op) and the Phase 0 results. Two subtleties the spike surfaced, already fixed in the spike code and reflected in the design doc: identity reconstruction must only set a non-null `authenticationType` when a `userId` is actually present (otherwise `ClaimsIdentity.IsAuthenticated` is `true` for anonymous connections too — it depends solely on `authenticationType`, not claim count), and the .NET 10 rejection-path close frame has no `allowReconnect` field at all.
+Both mechanisms were "designed against framework internals rather than exercised in code" — that's why Phase 0 existed before Phase 1 was planned. Both are now confirmed working in the real `src/Keryhe.Switchboard.Connector/` (promoted from the spike in Phase 1) with no fallback needed. See [docs/docs/00-review-findings.md](docs/docs/00-review-findings.md) for the history (a previous DI-override approach to negotiate interception turned out to be a silent no-op) and the Phase 0 results. Two subtleties the spike surfaced, already fixed in the spike code and reflected in the design doc: identity reconstruction must only set a non-null `authenticationType` when a `userId` is actually present (otherwise `ClaimsIdentity.IsAuthenticated` is `true` for anonymous connections too — it depends solely on `authenticationType`, not claim count), and the .NET 10 rejection-path close frame has no `allowReconnect` field at all.
 
 ### Server-facing vs. client-facing protocols are different wire formats
 
@@ -93,40 +86,25 @@ Why Orleans over Redis for both the registry and the backplane: [ADR-002](docs/d
 
 An app server token must never be able to drive the management API, and vice versa. Each has an independent `…Fallback` key for rotation. Rationale: [ADR-004](docs/docs/07-adr/ADR-004-token-authority.md).
 
-### Solution layout (target, per the project plan)
+### Solution layout (current — Phase 1)
 
 ```
 Switchboard.sln
 ├── src/
-│   ├── Keryhe.Switchboard.Core/        # interfaces/models, no ASP.NET dependency
-│   ├── Keryhe.Switchboard.Protocol/    # ServerEnvelope MessagePack + client-facing frame parsing
-│   ├── Keryhe.Switchboard.Server/      # main service host (Kestrel, DI wiring)
-│   ├── Keryhe.Switchboard.Registry/    # IConnectionRegistry in-memory impl
-│   ├── Keryhe.Switchboard.Orleans/     # grain interfaces + impls (Phase 3)
-│   ├── Keryhe.Switchboard.Management/  # management REST API
-│   └── Keryhe.Switchboard.Connector/   # app-server-side package (replaces AddAzureSignalR())
+│   ├── Keryhe.Switchboard.Core/        # interfaces/models, no ASP.NET dependency (Directory.Build.props enforces TreatWarningsAsErrors for src/)
+│   ├── Keryhe.Switchboard.Protocol/    # ServerEnvelope MessagePack + client-facing \x1e frame parsing; also IServerConnection/IHubRegistry/ServerConnectionState (depend on ServerEnvelope, so they live here rather than Core)
+│   ├── Keryhe.Switchboard.Server/      # main service host (Kestrel, DI wiring, negotiate/client/server-connection endpoints, JWT, CLI token command)
+│   ├── Keryhe.Switchboard.Registry/    # InMemoryConnectionRegistry, InMemoryHubRegistry, PendingConnectionStore, LocalTransportRegistry, NoOpBackplane
+│   └── Keryhe.Switchboard.Connector/   # app-server-side package (replaces AddAzureSignalR()) — negotiate interception, inbound dispatch, HubLifetimeManager, connection pool
 ├── tests/
-│   ├── Keryhe.Switchboard.UnitTests/
-│   └── Keryhe.Switchboard.IntegrationTests/
+│   ├── Keryhe.Switchboard.UnitTests/    # includes real-Kestrel-host e2e tests (TestSupport/RealKestrelServerFixture) since WebApplicationFactory's TestServer can't do real WebSockets
+│   └── Keryhe.Switchboard.IntegrationTests/  # out-of-process milestone test (ProcessFixture spawns real `dotnet` processes)
 └── samples/
     └── SampleChatApp/
-        ├── SampleChatApp.Api/          # ASP.NET Core Web API using the Connector
-        └── SampleChatApp.Angular/      # Angular SPA using @microsoft/signalr, unmodified
+        └── SampleChatApp.Api/          # ASP.NET Core Web API using the Connector (Angular is Phase 2 — not created yet)
 ```
 
-Full dependency graph and NuGet package list: [docs/docs/06-project-plan.md](docs/docs/06-project-plan.md).
-
-### Current layout (Phase 0 spike, exists today)
-
-```
-spike/
-├── Phase0.Spike.slnx
-├── Phase0.Spike.Connector/   # carry-forward: MatcherPolicy, synthetic ConnectionContext, HubPipelineFactory
-├── Phase0.Spike.Host/        # throwaway: test hubs, hand-rolled stub proxy target, dev JWT issuer
-├── Phase0.Spike.Tests/       # 22 xunit tests, WorkstreamA/ (negotiate) + WorkstreamB/ (dispatch)
-├── Phase0.Spike.JsClient/    # @microsoft/signalr redirect-check.mjs
-└── findings/                 # API recon + the two corrections found during testing
-```
+`Keryhe.Switchboard.Orleans` and `Keryhe.Switchboard.Management` are Phase 3 / Phase 4 respectively — not created yet, per the project plan's "don't scaffold empty placeholder projects" guidance. Full dependency graph and NuGet package list: [docs/docs/06-project-plan.md](docs/docs/06-project-plan.md).
 
 ## Documentation Map
 
@@ -144,6 +122,7 @@ Read in this order when picking up unfamiliar work:
 | [docs/docs/06-project-plan.md](docs/docs/06-project-plan.md) | Phased roadmap, solution structure, definition of done per phase |
 | [docs/docs/07-adr/](docs/docs/07-adr/) | Why, not just what, for the five foundational decisions |
 | [docs/docs/08-sample-app.md](docs/docs/08-sample-app.md) | Reference sample app used as the end-to-end integration target |
+| [docs/docs/09-phase0-findings/](docs/docs/09-phase0-findings/) | Verified .NET 10 framework facts from the Phase 0 spike (API recon, the required synthetic-connection feature set, the two design-doc corrections) — preserved when `spike/` was retired |
 
 `00-review-findings.md` is a living log — when a design decision changes during implementation, that's the place resolutions get recorded, and it should be checked before treating any of the other docs as final on a contested point.
 

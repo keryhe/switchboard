@@ -430,6 +430,8 @@ A single physical WebSocket connection between an app server and the service car
 
 The service assigns clients to server connections based on a load-distribution policy (default: round-robin across available server connections for the hub). Once a client is assigned to a server connection, all messages for that client flow over that same server connection for the lifetime of the client connection.
 
+> **Ordering requirement.** `open_connection` for a client MUST be written to that client's assigned server connection before any `client_message` for the same client, and every subsequent `client_message` MUST follow on that same connection, in order. The Connector's inbound dispatch ([04-design.md §11](04-design.md#11-connector--inbound-dispatch-synthetic-client-connections)) relies on this — there is deliberately no acknowledgement of `open_connection`, so a client invoking a hub method immediately after connecting is only safe because the single writer per server connection, plus TCP ordering, guarantees `open_connection` is processed first. This requirement is single-writer-per-connection, not "one envelope in flight at a time" — implementations must not write a given client's envelopes to two different server connections during its lifetime.
+
 ---
 
 ### 2.5 Protocol Version Negotiation

@@ -2,6 +2,8 @@
 
 The sample application is a real-time chat app that demonstrates the full end-to-end flow through the Switchboard. It is intentionally simple — the goal is to exercise every integration point, not to be a production chat product.
 
+> **Route correction (found during Phase 1 implementation):** this document's `/api/chatHub` illustration doesn't work — the service's own routes (`/{hub}/negotiate`, `/{hub}`, `/server/{hub}`) use a single-segment `{hub}` route parameter, which can't span multiple path segments. The real `SampleChatApp.Api` maps `ChatHub` at `/chatHub` instead. Treat every `/api/chatHub` reference below as `/chatHub`.
+
 ---
 
 ## Components

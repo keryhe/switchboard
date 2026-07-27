@@ -94,6 +94,12 @@ public record NegotiateResponse(
 );
 ```
 
+> **Dispatching step 1 vs step 2 (Phase 1, resolved).** Both steps hit the same `POST /{hub}/negotiate` URL. The endpoint dispatches on the **validated token type**, never on a caller-controlled query parameter or header: a token that validates against `ServerSigningKey` with `role: appserver` and `aud: switchboard-server` is step 1 (issue a redirect); a token that validates against `TokenSigningKey` with `aud: switchboard-client` is step 2 (issue the connect response). Anything else is `401`. This is a security-sensitive dispatch — getting it wrong in either direction lets a client token mint redirects or an app-server token claim a client connection — so each row, including the negative case, has a dedicated test (`Keryhe.Switchboard.UnitTests.Negotiate.NegotiateEndpointTests`).
+>
+> **Pending-connection store (Phase 1).** Step 2 mints the opaque `connectionToken` and must remember it until the client presents it on the transport upgrade. A TTL'd in-memory map (`IPendingConnectionStore`, keyed by `connectionToken`, TTL matched to `ClientTokenExpiry`) bridges the gap, with a background reaper evicting expired entries. A transport upgrade presenting an unknown or expired token gets `401`/`404`, never a new connection.
+>
+> **No app servers registered (Phase 1).** Step 2 fails fast rather than waiting/queueing: if `IHubRegistry` has no active server connection for the hub, negotiate returns `503` immediately (the earliest point the service can know) instead of accepting a transport it cannot service. Waiting/queueing for a server connection to appear is a Phase 3 resilience concern.
+
 ---
 
 ## 2. Client Connection Lifecycle
@@ -606,7 +612,7 @@ Required features:
 | `IConnectionLifetimeFeature` | Exposes `ConnectionClosed` and `Abort()` to framework code that reads them via the feature rather than the base `ConnectionContext` properties directly. |
 | `IConnectionCompleteFeature` | Lets framework code register a completion callback (`OnCompleted`) independent of pipeline teardown ordering. |
 
-> **Confirmed empirically in the Phase 0 spike** ([spike/findings/required-connection-features.md](../../spike/findings/required-connection-features.md)): the original four-feature list above is necessary but not exhaustive — `IConnectionLifetimeFeature` and `IConnectionCompleteFeature` are also required on the synthetic context. None of the original four turned out to be unnecessary.
+> **Confirmed empirically in the Phase 0 spike** ([09-phase0-findings/required-connection-features.md](09-phase0-findings/required-connection-features.md)): the original four-feature list above is necessary but not exhaustive — `IConnectionLifetimeFeature` and `IConnectionCompleteFeature` are also required on the synthetic context. None of the original four turned out to be unnecessary.
 
 > **`Context.GetHttpContext()` returns `null`.** There is no `IHttpContextFeature` — no HTTP request exists on the app server for this connection. Hub code that reads headers, cookies, or `RemoteIpAddress` from `GetHttpContext()` will NPE. Document as a known incompatibility; any such data must be passed as claims through `open_connection` instead.
 
@@ -652,7 +658,7 @@ foreach (var (type, value) in envelope.Claims ?? EmptyClaims)
 // there's an actual identity (userId) to assert. ClaimsIdentity.IsAuthenticated depends solely
 // on authenticationType being non-null/non-empty, NOT on claim count -- an unconditional
 // non-null authenticationType would silently authenticate anonymous connections too (confirmed
-// empirically in the Phase 0 spike; see spike/findings/inbound-dispatch-corrections.md).
+// empirically in the Phase 0 spike; see docs/docs/09-phase0-findings/inbound-dispatch-corrections.md).
 var authenticationType = envelope.UserId is not null ? "Switchboard" : null;
 var principal = new ClaimsPrincipal(new ClaimsIdentity(claims, authenticationType));
 features.Set<IConnectionUserFeature>(new ConnectionUserFeature { User = principal });
@@ -681,7 +687,7 @@ So the Connector runs a read loop on `_fromHub.Reader`, parsing with the connect
 
 ### Rejection path
 
-If the hub's `OnConnectedAsync` throws, `HubConnectionHandler` catches it, writes a close message, and returns without dispatching. **Confirmed in .NET 10 (Phase 0 spike):** the emitted frame is `{"type":7,"error":"Connection closed with an error."}` — there is **no `allowReconnect` field at all**, not `allowReconnect: false` as earlier assumed. Client libraries default a missing field to `false`, so behavior is unaffected, but implementations should not assume the field is present when parsing this frame. See [spike/findings/inbound-dispatch-corrections.md](../../spike/findings/inbound-dispatch-corrections.md). The Connector detects pipeline completion (or the close frame) and replies:
+If the hub's `OnConnectedAsync` throws, `HubConnectionHandler` catches it, writes a close message, and returns without dispatching. **Confirmed in .NET 10 (Phase 0 spike):** the emitted frame is `{"type":7,"error":"Connection closed with an error."}` — there is **no `allowReconnect` field at all**, not `allowReconnect: false` as earlier assumed. Client libraries default a missing field to `false`, so behavior is unaffected, but implementations should not assume the field is present when parsing this frame. See [09-phase0-findings/inbound-dispatch-corrections.md](09-phase0-findings/inbound-dispatch-corrections.md). The Connector detects pipeline completion (or the close frame) and replies:
 
 ```json
 { "type": "close_connection", "connectionId": "<id>", "error": "<reason>" }

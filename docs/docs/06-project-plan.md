@@ -56,12 +56,13 @@ Keryhe.Switchboard.Connector     ← Core + Protocol + Microsoft.AspNetCore.Sign
 | `Microsoft.Extensions.ObjectPool` | .NET 10 | Service (buffer pooling) |
 | `OpenTelemetry.Extensions.Hosting` | latest | Service (Phase 4) |
 | `OpenTelemetry.Instrumentation.AspNetCore` | latest | Service (Phase 4) |
+| `OpenTelemetry.Exporter.OpenTelemetryProtocol` | latest | Service (Phase 4) — OTLP export for logs, traces, and metrics; no Prometheus scrape endpoint |
 
 ---
 
 ## Phase 0 — Connector Mechanism Spike ✅ Complete (2026-07-26)
 
-Both mechanisms confirmed with no fallback needed. 22 automated tests + a real out-of-process `@microsoft/signalr` client check, all passing. Two design-doc corrections found and applied (identity-reconstruction `authenticationType` bug; rejection-frame shape). Full results: [00-review-findings.md § Phase 0 Spike Results](00-review-findings.md#phase-0-spike-results-2026-07-26), [spike/findings/](../../spike/findings/).
+Both mechanisms confirmed with no fallback needed. 22 automated tests + a real out-of-process `@microsoft/signalr` client check, all passing. Two design-doc corrections found and applied (identity-reconstruction `authenticationType` bug; rejection-frame shape). Full results: [00-review-findings.md § Phase 0 Spike Results](00-review-findings.md#phase-0-spike-results-2026-07-26), [docs/docs/09-phase0-findings/](09-phase0-findings/).
 
 **Goal:** Prove the Connector's **two** unproven mechanisms — negotiate interception ([04-design.md §8](04-design.md)) and inbound dispatch over a synthetic connection ([04-design.md §11](04-design.md#11-connector--inbound-dispatch-synthetic-client-connections)) — before committing the Phase 1 design. Time-boxed, but **produces a reusable skeleton** that Phase 1 builds on directly — not disposable code (see *Output → Phase 1* below).
 
@@ -90,7 +91,7 @@ Both mechanisms confirmed with no fallback needed. 22 automated tests + a real o
 
 ---
 
-## Phase 1 — Core Service (MVP)
+## Phase 1 — Core Service (MVP) — Implemented, milestone green
 
 **Goal:** A working single-node service where one ASP.NET Core app server connects and one client can send and receive hub method calls.
 
@@ -98,27 +99,29 @@ Both mechanisms confirmed with no fallback needed. 22 automated tests + a real o
 
 **Deliverables:**
 
-- [ ] Solution and project scaffolding
-- [ ] Promote the Phase 0 negotiate-interception skeleton into `Keryhe.Switchboard.Connector` (the working `MatcherPolicy`, or the fallback if the spike took it), replacing the stub redirect target with the real proxy-forwarding call; retire the Phase 0 scaffolding (throwaway host, stub target, hardcoded tokens) and fold its test clients into the integration test
-- [ ] `Keryhe.Switchboard.Core` interfaces: `IConnectionRegistry`, `IHubRegistry`, `IServerConnection`, `IClientTransport`, `IMessageRouter`, `INegotiationService`
-- [ ] `Keryhe.Switchboard.Protocol`: `ServerEnvelope` MessagePack serialization/deserialization (length-prefixed framing); client-facing JSON hub-protocol frame reader/writer using `\x1e` delimiter and `PipeReader`
-- [ ] Negotiation endpoint: `POST /{hub}/negotiate` → JWT + redirect URL
-- [ ] JWT issue and validation using `System.IdentityModel.Tokens.Jwt`
-- [ ] WebSocket client transport: accept, handshake, read loop, write channel
-- [ ] Server connection: app server WebSocket connection → handshake → register in Hub Registry
-- [ ] `InMemoryConnectionRegistry` and `InMemoryHubRegistry`
-- [ ] `DefaultMessageRouter`: `RouteClientMessage`, `RouteToConnection`, `Broadcast`
-- [ ] `open_connection` / `close_connection` notifications to app server
-- [ ] `Keryhe.Switchboard.Connector`: `IHubLifetimeManager` implementation — outbound only (`SendAllAsync`, `SendConnectionAsync`, group/user targeting → envelopes)
-- [ ] `Keryhe.Switchboard.Connector` inbound dispatch ([04-design.md §11](04-design.md#11-connector--inbound-dispatch-synthetic-client-connections)), promoted from the Phase 0 skeleton: per-hub `ConnectionDelegate`; `SwitchboardClientConnectionContext` (synthetic `ConnectionContext` + `Pipe` pair + `IConnectionUserFeature` / `IConnectionIdFeature` / `IConnectionItemsFeature` / `IConnectionHeartbeatFeature`); `open_connection` → principal reconstruction + handshake synthesis + pipeline start; `client_message` → verbatim payload write; `close_connection` → teardown
-- [ ] Connector outbound pipe reader: drop the synthetic handshake response and `PingMessage`, forward `Completion` / `StreamItem` / hub `Close` as `send_to_connection`
-- [ ] Connector rejection path: hub `OnConnectedAsync` failure → `close_connection` with `error` back to the service
-- [ ] `SwitchboardConnectorOptions`: `ServiceUrl`, `ServerAccessToken`, `ServerConnectionsPerHub`, `ReconnectDelay`
-- [ ] CLI tool (`dotnet switchboard token generate --role appserver|management`) for generating server and management access tokens
-- [ ] `PublicUrl` and `AllowedOrigins` in `SwitchboardOptions`; CORS middleware wired in service host
-- [ ] Integration test: .NET `HubConnection` client negotiates through `SampleChatApp.Api`, connects to proxy, sends and receives hub messages end-to-end
+- [x] Solution and project scaffolding
+- [x] Promote the Phase 0 negotiate-interception skeleton into `Keryhe.Switchboard.Connector` (the working `MatcherPolicy`), replacing the stub redirect target with the real proxy-forwarding call (`HttpNegotiateRedirectHandler`)
+- [x] `Keryhe.Switchboard.Core` interfaces: `IConnectionRegistry`, `IHubRegistry`, `IServerConnection`, `IClientTransport`, `IMessageRouter`, `INegotiationService`
+- [x] `Keryhe.Switchboard.Protocol`: `ServerEnvelope` MessagePack serialization/deserialization (length-prefixed framing); client-facing JSON hub-protocol frame reader/writer using `\x1e` delimiter and `PipeReader`
+- [x] Negotiation endpoint: `POST /{hub}/negotiate` → JWT + redirect URL (D1 dispatch on validated token type — see [04-design.md §1](04-design.md#1-negotiation-service))
+- [x] JWT issue and validation using `System.IdentityModel.Tokens.Jwt`
+- [x] WebSocket client transport: accept, handshake, read loop, write channel
+- [x] Server connection: app server WebSocket connection → handshake → register in Hub Registry
+- [x] `InMemoryConnectionRegistry` and `InMemoryHubRegistry`
+- [x] `DefaultMessageRouter`: `RouteClientMessageAsync`, `RouteToConnectionAsync`, `BroadcastAsync` (`SendToGroupAsync`/`SendToUserAsync` log-and-no-op per plan decision D3 — real routing is Phase 2)
+- [x] `open_connection` / `close_connection` notifications to app server
+- [x] `Keryhe.Switchboard.Connector`: `HubLifetimeManager<THub>` implementation — outbound only (all 13 abstract methods → envelopes)
+- [x] `Keryhe.Switchboard.Connector` inbound dispatch ([04-design.md §11](04-design.md#11-connector--inbound-dispatch-synthetic-client-connections)), promoted from the Phase 0 skeleton
+- [x] Connector outbound pipe reader: drop the synthetic handshake response and `PingMessage`, forward `Completion` / `StreamItem` / hub `Close` as `send_to_connection`
+- [x] Connector rejection path: hub `OnConnectedAsync` failure → `close_connection` with `error` back to the service
+- [x] `SwitchboardConnectorOptions`: `ServiceUrl`, `ServerAccessToken`, `ServerConnectionsPerHub`, `ReconnectDelay`
+- [x] CLI tool (`dotnet switchboard token generate --role appserver|management`) for generating server and management access tokens
+- [x] `PublicUrl` and `AllowedOrigins` in `SwitchboardOptions`; CORS middleware wired in service host
+- [x] Integration test written (`Keryhe.Switchboard.IntegrationTests.MilestoneEndToEndTests`) — passing
 
-**Milestone check:** `SampleChatApp.Api` connects to the proxy. A .NET SignalR client (using `Microsoft.AspNetCore.SignalR.Client`) negotiates through the API and successfully exchanges messages through the proxy. Integration test is green.
+**Milestone check — green.** `SampleChatApp.Api` connects to the proxy, a .NET `HubConnection` negotiates through the API, receives the server-pushed `Connected` message, and client-invoked hub methods (`JoinRoom`, `SendMessage`) execute on the app server with their completions travelling back to the client. The inbound-dispatch stall that previously blocked this was root-caused to the service stripping the `\x1e` record separator from `client_message` payloads, violating the "payload includes framing" contract the Connector's synthetic connection depends on — see [00-review-findings.md § Phase 1](00-review-findings.md) for the full analysis. Both previously-skipped tests (`ConnectorEndToEndTests`, `MilestoneEndToEndTests`) are unskipped and green.
+
+> One caveat on the milestone's scope: `ChatHub.SendMessage` fans out via `Clients.Group(...)`, and group fan-out is a deliberate Phase 1 no-op (**D3**). The milestone test asserts that absence rather than group delivery; the full chat-room receive flow lands with Phase 2's group routing.
 
 ---
 
@@ -181,20 +184,21 @@ Both mechanisms confirmed with no fallback needed. 22 automated tests + a real o
 
 - [ ] `Keryhe.Switchboard.Management` REST API (all endpoints from [Protocol Specification](03-protocol.md) Part 3)
 - [ ] Management API auth: management access token signed with `ManagementSigningKey` (third independent secret), `role: management` claim required, `aud` = `ManagementAudience`; server access tokens explicitly rejected ([03-protocol.md Part 3](03-protocol.md#part-3-management-rest-api))
-- [ ] OpenTelemetry metrics:
+- [ ] OpenTelemetry metrics, exported via **OTLP** (`OpenTelemetry.Exporter.OpenTelemetryProtocol`) — no Prometheus scrape endpoint; the collector/backend is external to this service, configured by whoever operates it:
   - `signalr.client_connections.active` (gauge, by hub)
   - `signalr.server_connections.active` (gauge, by hub)
   - `signalr.messages.routed` (counter, by direction and hub)
   - `signalr.broadcast.fan_out_size` (histogram)
   - `signalr.message.latency` (histogram, client→server round trip)
-- [ ] OpenTelemetry tracing: spans for negotiate, client connect, message route
-- [ ] Structured logging (Microsoft.Extensions.Logging): connection lifecycle events, routing errors, server connection health changes
+  - `signalr.envelopes.unrouted` (counter, by envelope type) — the D3/D4 metrics deferred from [Phase 1](../../plans/phase-1-core-service-mvp.md) (unrouted group/user envelopes; the pending-connection gauge below)
+  - `signalr.pending_connections.active` (gauge) — deferred from Phase 1 D4
+- [ ] OpenTelemetry tracing: spans for negotiate, client connect, message route — exported via OTLP
+- [ ] Structured logging (Microsoft.Extensions.Logging): connection lifecycle events, routing errors, server connection health changes — exported via OTLP alongside traces and metrics, so all three signals land in the same backend
 - [ ] `/healthz` endpoint: public, unauthenticated liveness/readiness (200/503, no topology detail); detailed per-hub connection status behind the authenticated management API (`GET /api/v1/health`)
-- [ ] `/metrics` endpoint (Prometheus format via `OpenTelemetry.Exporter.Prometheus.AspNetCore`)
 - [ ] Admin UI docs (optional): Swagger/OpenAPI spec for management API
 - [ ] Operations guide: the three token types and their independent signing keys, generation via the CLI, rotation procedure using the `…Fallback` keys, and secret storage guidance ([ADR-004](07-adr/ADR-004-token-authority.md))
 
-**Milestone check:** Grafana dashboard showing active connections, message throughput, and fan-out size can be built from `/metrics`. An on-call engineer can broadcast a maintenance notice via `curl`.
+**Milestone check:** Active connections, message throughput, and fan-out size are visible on a dashboard built against the OTLP-exported metrics, checked manually against the operator's own visualization tooling (not Grafana-specific — no dashboard-as-code deliverable here). An on-call engineer can broadcast a maintenance notice via `curl`.
 
 ---
 

@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Keryhe.Switchboard.Core\Keryhe.Switchboard.Core.csproj" />
+    <ProjectReference Include="..\Keryhe.Switchboard.Protocol\Keryhe.Switchboard.Protocol.csproj" />
+  </ItemGroup>
+
+</Project>

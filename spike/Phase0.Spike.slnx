@@ -1,5 +1,0 @@
-<Solution>
-  <Project Path="Phase0.Spike.Connector/Phase0.Spike.Connector.csproj" />
-  <Project Path="Phase0.Spike.Host/Phase0.Spike.Host.csproj" />
-  <Project Path="Phase0.Spike.Tests/Phase0.Spike.Tests.csproj" />
-</Solution>
