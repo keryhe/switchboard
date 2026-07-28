@@ -26,8 +26,8 @@ public sealed class InMemoryHubRegistry : IHubRegistry
 
     public HubDescriptor? GetHub(string hubName) => _hubs.GetValueOrDefault(hubName);
 
-    public bool HasActiveServerConnection(string hubName) =>
-        _hubs.TryGetValue(hubName, out var descriptor) && descriptor.ActiveServerConnectionCount > 0;
+    public Task<bool> HasActiveServerConnectionAsync(string hubName, CancellationToken ct) =>
+        Task.FromResult(_hubs.TryGetValue(hubName, out var descriptor) && descriptor.ActiveServerConnectionCount > 0);
 
     public IEnumerable<HubDescriptor> GetAllHubs() => _hubs.Values;
 }

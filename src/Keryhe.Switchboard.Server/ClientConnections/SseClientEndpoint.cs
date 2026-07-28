@@ -24,13 +24,16 @@ public static class SseClientEndpoint
         IConnectionRegistry connectionRegistry,
         ILocalTransportRegistry localTransportRegistry,
         ClientConnectionManager connectionManager,
+        IHubRegistry hubRegistry,
         IServerConnectionSelector serverConnectionSelector,
+        IBackplane backplane,
         IMessageRouter router,
-        IOptions<SwitchboardOptions> options)
+        IOptions<SwitchboardOptions> options,
+        ITransportOwnershipRegistry ownershipRegistry)
     {
         var connectionToken = context.Request.Query["id"].ToString();
-        var result = ClientConnectionValidation.Establish(
-            context, hub, connectionToken, tokenService, pendingConnections, serverConnectionSelector);
+        var result = await ClientConnectionValidation.EstablishAsync(
+            context, hub, connectionToken, tokenService, pendingConnections, serverConnectionSelector, options.Value.NodeId);
         if (!result.Success)
         {
             context.Response.StatusCode = result.ErrorStatusCode!.Value;
@@ -38,7 +41,7 @@ public static class SseClientEndpoint
         }
 
         var pending = result.Pending!;
-        var serverConnectionState = result.ServerConnectionState!;
+        var serverConnectionRef = result.ServerConnectionRef!;
         var ct = context.RequestAborted;
 
         await using var transport = new SseClientTransport(
@@ -48,6 +51,11 @@ public static class SseClientEndpoint
         // Findable by POST (the handshake request itself, then every message after) before a
         // ClientConnection exists to register normally — see ClientConnectionManager's doc comment.
         connectionManager.RegisterTransport(connectionToken, transport);
+
+        // Claimed before the response headers are flushed below (plan decision D19) — the
+        // handshake POST that follows can arrive on another node the instant the client observes
+        // this stream open, and it must already be able to resolve this node as the owner.
+        await ownershipRegistry.ClaimAsync(connectionToken, options.Value.NodeId, ct);
 
         try
         {
@@ -79,8 +87,9 @@ public static class SseClientEndpoint
             var connection = new ClientConnection(pending.ConnectionId, connectionToken, hub, pending.UserId, transport, protocol);
 
             var lifecycleTask = ClientConnectionLifecycle.RunAsync(
-                connection, pending, enumerator, connectionRegistry, localTransportRegistry,
-                connectionManager, serverConnectionState, router, options.Value.ClientKeepAliveInterval, ct);
+                connection, pending, enumerator, TransportType.ServerSentEvents, connectionRegistry, localTransportRegistry,
+                connectionManager, hubRegistry, serverConnectionSelector, backplane, serverConnectionRef, options.Value.NodeId,
+                router, options.Value.ClientKeepAliveInterval, ct);
 
             await WriteOutputAsync(context, transport, ct);
             await lifecycleTask;
@@ -88,6 +97,7 @@ public static class SseClientEndpoint
         finally
         {
             connectionManager.UnregisterTransport(connectionToken);
+            await ownershipRegistry.ReleaseAsync(connectionToken, CancellationToken.None);
         }
     }
 

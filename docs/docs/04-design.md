@@ -106,7 +106,7 @@ public record NegotiateResponse(
 >
 > **Pending-connection store (Phase 1).** Step 2 mints the opaque `connectionToken` and must remember it until the client presents it on the transport upgrade. A TTL'd in-memory map (`IPendingConnectionStore`, keyed by `connectionToken`, TTL matched to `ClientTokenExpiry`) bridges the gap, with a background reaper evicting expired entries. A transport upgrade presenting an unknown or expired token gets `401`/`404`, never a new connection.
 >
-> **No app servers registered (Phase 1).** Step 2 fails fast rather than waiting/queueing: if `IHubRegistry` has no active server connection for the hub, negotiate returns `503` immediately (the earliest point the service can know) instead of accepting a transport it cannot service. Waiting/queueing for a server connection to appear is a Phase 3 resilience concern.
+> **No app servers registered.** Step 2 fails fast rather than waiting/queueing: if `IHubRegistry` has no active server connection for the hub, negotiate returns `503` immediately (the earliest point the service can know) instead of accepting a transport it cannot service. True in every deployment mode — Phase 3 (plan decision D18) made this check cluster-wide instead of node-local, but did not add waiting/queueing; a still-open resilience concern for a later phase, not something implemented here.
 
 ---
 
@@ -119,7 +119,7 @@ public record NegotiateResponse(
 
 ### Accept Phase
 1. Service validates the JWT from the `access_token` query parameter and reads the `connectionToken` from the `id` query parameter
-2. Extracts `connectionId` and `hubName` from JWT claims, and resolves the `connectionToken` to this connection (in Phase 3 the token also identifies the owning node, so a request landing on a non-owning node can be routed appropriately)
+2. Extracts `connectionId` and `hubName` from JWT claims, and resolves the `connectionToken` to this connection. In a clustered deployment (Phase 3), the token itself never identifies the owning node — for SSE/Long Polling, a request landing on a non-owning node instead resolves ownership via `IConnectionTokenOwnerGrain` (keyed by the token) and forwards internally (plan decision D19); WebSocket's single-request lifecycle needs no such lookup.
 3. Registers a **pending** connection in `IConnectionRegistry` with `HubProtocol = null`
 4. Registers the local `IClientTransport` handle in `ILocalTransportRegistry`
 5. Finds (or waits for) an available server connection in the Hub Registry
@@ -234,16 +234,17 @@ public record ClientConnectionState(
 }
 ```
 
-### Distributed (Phase 3)
+### Distributed (Phase 3, implemented)
 
-Orleans grain-based registry. Each grain type owns one slice of the connection state:
+Orleans grain-based registry. **Correction from the original sketch:** there is no `IGroupGrain`/`IUserGrain` in the implementation — group and user fan-out went a different way (plan decision D17, §7 below): published by name to every subscribed node, each node resolving membership against its own `ILocalTransportRegistry`, rather than a grain tracking membership at all. What's actually there:
 
-- `IConnectionGrain` (key: `connectionId`) — stores `{ownerNodeId, hubName, userId, connectedAt}`; looked up on every targeted `send_to_connection`
-- `IHubGrain` (key: `hubName`) — stores the full set of `{connectionId, nodeId}` pairs; iterated for broadcasts
-- `IGroupGrain` (key: `"hubName::groupName"`) — stores the set of `connectionId` values in the group
-- `IUserGrain` (key: `"hubName::userId"`) — stores the set of `connectionId` values for a user
+- `IConnectionGrain` (key: `connectionId`) — stores `{ownerNodeId, hubName, ...}`; looked up on every targeted `send_to_connection` and on any cross-node `AddToGroup`/`RemoveFromGroup`/`CloseConnection`
+- `IHubGrain` (key: `hubName`) — per-hub client-connection membership (diagnostics only — not the fan-out hot path, D14), the observer subscriptions that make it the backplane's cross-silo coordinator for the hub, and (Phase 3 Slice 4, plan decision D18) the cluster-wide server-connection inventory and least-loaded assignment
+- `INodeRegistryGrain` (key: fixed `"cluster"`) — each node's `InternalUrl` (Phase 3 Slice 5, plan decision D19)
+- `IConnectionTokenOwnerGrain` (key: the opaque `connectionToken` itself) — which node claimed an SSE/Long Polling transport (see the `connectionToken` correction note in [03-protocol.md §1.1](03-protocol.md))
+- `IPendingConnectionGrain` (key: `connectionToken`) — the step-2-negotiate-to-transport-upgrade bridge, made a grain from Phase 3 Slice 1 onward
 
-`OrleansConnectionRegistry` implements `IConnectionRegistry` by delegating to these grains via `IGrainFactory`. Local transport handles (`IClientTransport`) are never stored in grain state — they are kept in a node-local `ILocalTransportRegistry` (a `ConcurrentDictionary` in a singleton service) and looked up by `connectionId` after grain calls return the owner node ID.
+`OrleansConnectionRegistry` implements `IConnectionRegistry` by delegating to these grains via `IGrainFactory`. Local transport handles (`IClientTransport`) and the node-local hub/group/user membership indexes are never stored in grain state — they are kept in a node-local `ILocalTransportRegistry` singleton and looked up by `connectionId` after grain calls return the owner node ID.
 
 ### Interface
 ```csharp
@@ -297,19 +298,23 @@ public interface IMessageRouter
 
 > **`RouteToConnectionAsync` carries only a single `payload`/`hubProtocol`, never `payloadsByProtocol`** — a targeted send has exactly one recipient, whose protocol the sender already knows (03-protocol.md §2.3).
 
-### Fan-out Strategy (Phase 1/2, implemented)
+### Fan-out Strategy (Phase 1/2/3, implemented)
 
 Group and user fan-out (Phase 1 deliverable; deferred no further after plan decision **D3**'s
 Phase 1 log-and-no-op placeholder) and broadcast fan-out all route through the same node-local
-path: the registry resolves the hub/group/user to a set of `ClientConnectionState`, each connection
-picks its own payload from `payloadsByProtocol` (or falls back to `payload`) via its recorded
-`hubProtocol`, and the write goes through that connection's bounded per-connection write channel
-(`WriteChannelCapacity`/`WriteChannelFullMode`, default `DropWrite`) — never a blocking write, so
-one slow client cannot stall fan-out to every other client. This is explicitly **node-local**: all
-of it goes through `ILocalTransportRegistry`, and cross-node fan-out remains `IBackplane`'s
-job — still `NoOpBackplane` in Phase 2, unchanged from Phase 1. The batched/partitioned
-`Parallel.ForEachAsync` large-hub strategy originally sketched here remains a Phase 3+ scaling
-concern, not yet needed at Phase 2's tested scale.
+path first: the local index (`ILocalTransportRegistry`) resolves the hub/group/user to this node's
+own connections, each connection picks its own payload from `payloadsByProtocol` (or falls back to
+`payload`) via its recorded `hubProtocol`, and the write goes through that connection's bounded
+per-connection write channel (`WriteChannelCapacity`/`WriteChannelFullMode`, default `DropWrite`) —
+never a blocking write, so one slow client cannot stall fan-out to every other client. Local
+delivery is batched with bounded parallelism (`DefaultMessageRouter.FanOutAsync`), not one
+`Parallel.ForEachAsync` sweep over every recipient at once. **Cross-node fan-out (Phase 3,
+implemented):** after local delivery, `IBackplane` is published to exactly once per operation
+(plan decision D14) — `NoOpBackplane` in single-node deployments (nothing to publish to), or
+`OrleansObserverBackplane` in clustered ones, which publishes by name (group/user, plan decision
+D17) or targets one connection's owner node directly (`send_to_connection`), letting each receiving
+node repeat the same node-local resolve-and-write against its own index rather than the grain ever
+enumerating membership itself.
 
 ---
 
@@ -373,7 +378,9 @@ last poll exceeds `DisconnectTimeout`, since there is no socket-close event to n
 
 ---
 
-## 7. Backplane Design (Phase 3)
+## 7. Backplane Design (Phase 3, implemented)
+
+> **This section has been corrected to match the actual implementation**, which diverged from the original sketch in a few ways found necessary during Phase 3: `IHubObserver` methods return `Task`, not `void` (a `void` observer method gives the calling grain no exception to catch, so a dead node's reference could never be detected or evicted); `IGroupGrain`/`IUserGrain` do exist, but only as the authoritative source for membership *queries* and disconnect cleanup — the actual fan-out hot path never consults them, publishing by name instead so each node resolves membership against its own local index (plan decision D17); and the grain topology grew several members the original design didn't anticipate (`INodeRegistryGrain`, `IConnectionTokenOwnerGrain`, `IPendingConnectionGrain`, and the cluster-wide server-connection inventory folded into `IHubGrain`, plan decision D18).
 
 ### Problem
 In a clustered deployment with multiple service nodes, a broadcast from an app server connected to Node A must also reach clients connected to Node B.
@@ -394,71 +401,163 @@ AppServer → ServiceNodeA → local fan-out (ILocalTransportRegistry)
                          → ILocalTransportRegistry → local clients on Node B
 ```
 
-**Self-echo prevention:** `BroadcastAsync` accepts `originNodeId`. The hub grain maintains `Dictionary<string, IHubObserver> _observers` keyed by `nodeId`. When broadcasting, it skips the observer registered under `originNodeId` — that node already handled its local clients before calling into the grain.
+**Self-echo prevention:** `BroadcastAsync` accepts `originNodeId`. The hub grain maintains a `Dictionary<string, (IHubObserver Observer, DateTimeOffset LastSeen)> _observers` keyed by `nodeId` (the `LastSeen` timestamp, stamped on every re-subscribe, is what backs staleness eviction below). When broadcasting, it skips the observer registered under `originNodeId` — that node already handled its local clients before calling into the grain.
 
-**Targeted `send_to_connection`:** The router calls `IConnectionGrain.GetOwnerNodeAsync(connectionId)` to find the owning node ID, then calls `IHubObserver.OnConnectionMessage(connectionId, payload)` on the observer for that node. No broadcast; single observer call.
+**Re-subscription, not one-time registration:** `ObserverHeartbeatService` calls `SubscribeAsync` on every heartbeat tick (`SwitchboardOptions.ObserverHeartbeatInterval`), not just once at startup. A hub grain deactivation silently drops every subscription with no error anywhere — periodic re-subscription is what makes that, and a genuinely dead node's stale entry, both self-heal without an operator restarting anything. A node whose last re-subscribe is older than roughly three heartbeat intervals is pruned proactively (`PruneStaleObservers`), in addition to the `ClientNotAvailableException`-triggered eviction a live but now-dead observer reference throws on its next call.
+
+**Targeted `send_to_connection`:** The router calls `IConnectionGrain.GetOwnerNodeAsync(connectionId)` to find the owning node, then calls `IHubGrain.SendToConnectionAsync(targetNodeId, connectionId, payload, hubProtocol)`, which invokes `IHubObserver.OnConnectionMessage` on that one node's observer. No broadcast; a single targeted call, dropped with a logged warning (not an error) if that node has no active subscription.
+
+**Targeted server-connection delivery and cluster-wide assignment (Phase 3 Slice 4, plan decision D18):** once server-connection assignment is cluster-wide, `IHubGrain` additionally owns the pool of app-server connections registered anywhere in the cluster (`RegisterServerConnectionAsync`/`UnregisterServerConnectionAsync`/`AssignServerConnectionAsync` — least-loaded pick, restricted to connections this call can actually reach: the requesting node's own, or a node with an active observer subscription) and two more targeted-delivery methods mirroring `SendToConnectionAsync`'s shape: `SendServerEnvelopeAsync` (an arbitrary already-serialized `ServerEnvelope` — open/client-message/close — to one node's specific server connection) and `CloseConnectionAsync` (closes one client connection on its owning node, `allowReconnect: true` when its assigned server connection was lost, `false` for an app server's own explicit close).
+
+**Cross-node group membership (Phase 3 Slice 7 fix, plan decision D18):** every `AddToGroup`/`RemoveFromGroup` envelope updates `IConnectionGrain`/`IGroupGrain`(/`IUserGrain`) unconditionally — that's the authoritative registry, node-independent by construction. But the *fan-out cache* (`ILocalTransportRegistry`'s node-local group index, the one `OnGroupMessage` actually reads) is node-local state, and the app server sending the envelope may no longer share a node with the connection it names once assignment is cluster-wide. `RoutingServerEnvelopeDispatcher` mutates that cache directly on a local hit; on a miss, `IBackplane.PublishAddToGroupAsync`/`PublishRemoveFromGroupAsync` resolve the owner via `IConnectionGrain.GetOwnerNodeAsync()` and forward to `IHubGrain.AddToGroupCrossNodeAsync`/`RemoveFromGroupCrossNodeAsync` → `IHubObserver.OnAddToGroup`/`OnRemoveFromGroup` on that node — the identical owner-lookup-then-targeted-call shape `CloseConnectionAsync` already used. Before this fix, a client whose group-join landed on the wrong node's cache would show up correctly in the authoritative `IGroupGrain` (so a management-API membership query would look right) while silently never receiving a single group fan-out message.
 
 ### IHubObserver — Per-Node Observer Interface
 
 ```csharp
 public interface IHubObserver : IGrainObserver
 {
-    void OnBroadcast(byte[] payload, string hubProtocol, string[] excludedConnectionIds);
-    void OnGroupMessage(string groupName, byte[] payload, string hubProtocol, string[] excludedConnectionIds);
-    void OnUserMessage(string userId, byte[] payload, string hubProtocol);
-    void OnConnectionMessage(string connectionId, byte[] payload, string hubProtocol);
+    // Every method returns Task, not void — a void observer method gives the calling grain no
+    // exception to catch, so a dead node's reference could never be detected or evicted.
+    Task OnBroadcast(byte[] payload, Dictionary<string, byte[]>? payloadsByProtocol, string[] excludedConnectionIds);
+    Task OnGroupMessage(string groupName, byte[] payload, Dictionary<string, byte[]>? payloadsByProtocol, string[] excludedConnectionIds);
+    Task OnUserMessage(string userId, byte[] payload, Dictionary<string, byte[]>? payloadsByProtocol);
+    Task OnConnectionMessage(string connectionId, byte[] payload, string hubProtocol);
+
+    // Phase 3 Slice 4 (D18) additions — app-server-facing delivery and full connection teardown.
+    Task OnServerEnvelope(string serverConnectionId, byte[] serializedEnvelope);
+    Task OnCloseConnection(string connectionId, string? error, bool allowReconnect);
+
+    // Phase 3 Slice 7 fix (D18) — cross-node group membership, see above.
+    Task OnAddToGroup(string connectionId, string groupName);
+    Task OnRemoveFromGroup(string connectionId, string groupName);
 }
 ```
 
-`HubObserverImpl` is a concrete class (not a grain — it is a plain object) that the service node registers with each hub grain. It holds a reference to `ILocalTransportRegistry` injected at construction time.
+`payloadsByProtocol` carries one payload encoding per hub protocol (plan decision D7) — the receiving node's local targets may be mixed-protocol and unknown to the sender in advance, so each one picks its own entry by its negotiated `hubProtocol`.
 
-### Orleans Grain Interfaces
+`HubObserverImpl` is a concrete class (not a grain — it is a plain object), one instance per hub each node knows about, registered with that hub's grain by `ObserverHeartbeatService`. It holds references to `ILocalTransportRegistry` (client-facing delivery) and, for the D18 additions, `IHubRegistry`/`IConnectionRegistry` (app-server-facing delivery and full connection teardown) injected at construction time — delivery never leaves the process.
+
+### Orleans Grain Interfaces (as implemented)
 
 ```csharp
 public interface IHubGrain : IGrainWithStringKey          // key: hubName
 {
-    Task RegisterConnectionAsync(string connectionId, string nodeId);
+    Task RegisterConnectionAsync(string connectionId);
     Task UnregisterConnectionAsync(string connectionId);
+    Task<List<string>> GetConnectionIdsAsync();
+
     Task SubscribeAsync(IHubObserver observer, string nodeId);
     Task UnsubscribeAsync(string nodeId);
-    Task BroadcastAsync(byte[] payload, string hubProtocol, string[] excludedConnectionIds, string originNodeId);
-    Task SendToGroupAsync(string groupName, byte[] payload, string hubProtocol, string[] excludedConnectionIds, string originNodeId);
-    Task SendToUserAsync(string userId, byte[] payload, string hubProtocol, string originNodeId);
-    Task SendToConnectionAsync(string connectionId, byte[] payload, string hubProtocol);
-}
 
-public interface IGroupGrain : IGrainWithStringKey         // key: "hubName::groupName"
-{
-    Task AddAsync(string connectionId, string nodeId);
-    Task RemoveAsync(string connectionId);
-}
+    Task BroadcastAsync(byte[] payload, Dictionary<string, byte[]>? payloadsByProtocol, string[] excludedConnectionIds, string originNodeId);
+    Task GroupMessageAsync(string groupName, byte[] payload, Dictionary<string, byte[]>? payloadsByProtocol, string[] excludedConnectionIds, string originNodeId);
+    Task UserMessageAsync(string userId, byte[] payload, Dictionary<string, byte[]>? payloadsByProtocol, string originNodeId);
+    Task SendToConnectionAsync(string targetNodeId, string connectionId, byte[] payload, string hubProtocol);
 
-public interface IUserGrain : IGrainWithStringKey          // key: "hubName::userId"
-{
-    Task AddConnectionAsync(string connectionId, string nodeId);
-    Task RemoveConnectionAsync(string connectionId);
+    // Phase 3 Slice 4 (D18): cluster-wide server-connection inventory and assignment.
+    Task RegisterServerConnectionAsync(string nodeId, string serverConnectionId);
+    Task UnregisterServerConnectionAsync(string nodeId, string serverConnectionId);
+    Task<ServerConnectionAssignment?> AssignServerConnectionAsync(string requestingNodeId);
+    Task ReleaseServerConnectionAsync(string nodeId, string serverConnectionId);
+    Task<bool> HasActiveServerConnectionAsync();
+    Task SendServerEnvelopeAsync(string targetNodeId, string serverConnectionId, byte[] serializedEnvelope);
+    Task CloseConnectionAsync(string targetNodeId, string connectionId, string? error, bool allowReconnect);
+
+    // Phase 3 Slice 7 fix (D18): cross-node group membership.
+    Task AddToGroupCrossNodeAsync(string targetNodeId, string connectionId, string groupName);
+    Task RemoveFromGroupCrossNodeAsync(string targetNodeId, string connectionId, string groupName);
+
+    Task<int> GetSubscriberCountAsync();  // operational introspection
 }
 
 public interface IConnectionGrain : IGrainWithStringKey   // key: connectionId
 {
-    Task SetOwnerAsync(string nodeId, string hubName, string? userId);
-    Task<string?> GetOwnerNodeAsync();
-    Task ClearAsync();
+    Task RegisterAsync(ConnectionRecord record);
+    Task<ConnectionRecord?> GetAsync();
+
+    // Lean lookup for cross-node targeted sends (D17) — only the owning node and hub, not the
+    // full record. Null means not currently registered (already disconnected, or never existed).
+    Task<ConnectionLocation?> GetOwnerNodeAsync();
+
+    Task SetHubProtocolAsync(string hubProtocol);
+    Task AddToGroupAsync(string groupName);      // also updates IGroupGrain — see below
+    Task RemoveFromGroupAsync(string groupName); // also updates IGroupGrain — see below
+    Task UnregisterAsync();
+
+    // For HubGrain.UnregisterServerConnectionAsync (D18) only — same cleanup as UnregisterAsync,
+    // but never calls back into IHubGrain.UnregisterConnectionAsync, avoiding a real call cycle
+    // (verified to deadlock: Orleans grains process one call at a time) when the hub grain is
+    // already the one making this call.
+    Task UnregisterWithoutHubCallbackAsync();
+}
+
+public sealed class ConnectionLocation
+{
+    public required string OwnerNodeId { get; init; }
+    public required string HubName { get; init; }
+}
+
+// Authoritative membership — consulted for management-API queries and disconnect cleanup, never
+// on the fan-out hot path (see the "no grain on the fan-out path" note below).
+public interface IGroupGrain : IGrainWithStringKey   // key: "hubName::groupName"
+{
+    Task AddAsync(string connectionId);
+    Task RemoveAsync(string connectionId);
+    Task<List<string>> GetMembersAsync();
+}
+
+public interface IUserGrain : IGrainWithStringKey    // key: "hubName::userId"
+{
+    Task AddConnectionAsync(string connectionId);
+    Task RemoveConnectionAsync(string connectionId);
+    Task<List<string>> GetConnectionIdsAsync();
+}
+
+// Phase 3 Slice 5 (D19): SSE/Long Polling node affinity.
+public interface INodeRegistryGrain : IGrainWithStringKey  // key: fixed "cluster"
+{
+    Task RegisterAsync(string nodeId, string internalUrl);
+    Task UnregisterAsync(string nodeId);
+    Task<string?> GetInternalUrlAsync(string nodeId);
+}
+
+public interface IConnectionTokenOwnerGrain : IGrainWithStringKey  // key: connectionToken
+{
+    Task ClaimAsync(string nodeId);
+    Task ReleaseAsync();
+    Task<string?> GetOwnerNodeIdAsync();
+}
+
+// Phase 3 Slice 1: the negotiate-to-transport-upgrade bridge, made a grain so a client can
+// negotiate on one node and open its transport on another.
+public interface IPendingConnectionGrain : IGrainWithStringKey  // key: connectionToken
+{
+    // ... mirrors IPendingConnectionStore's single-shot-consumption + TTL semantics.
 }
 ```
 
-> **Group and User grains:** `IGroupGrain` and `IUserGrain` store `{connectionId, nodeId}` pairs so the hub grain can resolve node ownership without additional `IConnectionGrain` lookups for fan-out. When a connection joins a group, the node ID is passed alongside the connection ID.
+> **`IGroupGrain`/`IUserGrain` exist, but never on the fan-out path.** They're the authoritative store `IConnectionRegistry.GetGroupMembersAsync`/`GetUserConnectionsAsync` reads for management-API queries, and `IConnectionGrain.UnregisterAsync` uses them for disconnect cleanup (the connection's own `Groups` set, mirrored onto its `ConnectionRecord`, is what lets that happen without a cross-grain scan). But **fan-out itself never queries them** (plan decision D17): `IHubGrain.GroupMessageAsync`/`UserMessageAsync` publish **by name** to every subscribed node's observer, and each node resolves membership and per-protocol payload selection against its own local `ILocalTransportRegistry` cache instead — a grain round trip on every single message would be far too slow, and the local cache is exactly what the Slice 7 fix above had to teach the cluster-wide-assignment case to keep in sync.
 
-### Backplane Interface
+### Backplane Interface (as implemented)
 ```csharp
 public interface IBackplane
 {
-    Task PublishBroadcastAsync(string hubName, byte[] payload, string hubProtocol, string[] excludedConnectionIds, CancellationToken ct);
-    Task PublishGroupMessageAsync(string hubName, string groupName, byte[] payload, string hubProtocol, string[] excludedConnectionIds, CancellationToken ct);
-    Task PublishUserMessageAsync(string hubName, string userId, byte[] payload, string hubProtocol, CancellationToken ct);
-    Task PublishToConnectionAsync(string connectionId, byte[] payload, string hubProtocol, CancellationToken ct);
+    Task PublishBroadcastAsync(string hubName, byte[] payload, string hubProtocol, IReadOnlyDictionary<string, byte[]>? payloadsByProtocol, string[] excludedConnectionIds, string originNodeId, CancellationToken ct);
+    Task PublishGroupMessageAsync(string hubName, string groupName, byte[] payload, string hubProtocol, IReadOnlyDictionary<string, byte[]>? payloadsByProtocol, string[] excludedConnectionIds, string originNodeId, CancellationToken ct);
+    Task PublishUserMessageAsync(string hubName, string userId, byte[] payload, string hubProtocol, IReadOnlyDictionary<string, byte[]>? payloadsByProtocol, string originNodeId, CancellationToken ct);
+    Task PublishToConnectionAsync(string connectionId, byte[] payload, string hubProtocol, string originNodeId, CancellationToken ct);
+
+    // Phase 3 Slice 4 (D18): service -> app-server delivery when the assigned connection isn't local.
+    Task PublishServerEnvelopeAsync(string hubName, string serverConnectionRef, byte[] serializedEnvelope, CancellationToken ct);
+    Task PublishCloseConnectionAsync(string connectionId, string? error, bool allowReconnect, string originNodeId, CancellationToken ct);
+
+    // Phase 3 Slice 7 fix (D18): cross-node group membership.
+    Task PublishAddToGroupAsync(string connectionId, string groupName, string originNodeId, CancellationToken ct);
+    Task PublishRemoveFromGroupAsync(string connectionId, string groupName, string originNodeId, CancellationToken ct);
 }
 ```
+
+`NoOpBackplane` implements every method as a no-op in single-node deployments — every `DefaultMessageRouter`/`RoutingServerEnvelopeDispatcher` call site already delivers to every local target before calling this (plan decision D14), so a no-op is behavior-preserving. `OrleansObserverBackplane` implements the clustered path: the three fan-out methods publish by name straight to `IHubGrain`; the five targeted methods (`PublishToConnectionAsync`, `PublishServerEnvelopeAsync`, `PublishCloseConnectionAsync`, `PublishAddToGroupAsync`, `PublishRemoveFromGroupAsync`) resolve an owner node first — either parsed directly out of a node-qualified `ServerConnectionRef`, or via `IConnectionGrain.GetOwnerNodeAsync()` — and call only that one node's observer.
 
 ---
 

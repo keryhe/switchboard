@@ -58,7 +58,7 @@ Because all clients connect to the service, the service has a complete view of e
 A single instance of the service running on one machine. Suitable for development, small deployments, or environments where HA is handled at a higher layer (e.g., VM failover). Connection state is held entirely in memory.
 
 ### Clustered (Phase 3)
-Multiple service nodes behind a load balancer. Clients can connect to any node. Each service node runs an Orleans silo; connection state is held in Orleans grains, and messages between nodes flow via Orleans grain observers (each node registers a local observer with the hub grain). A shared SQL database (SQL Server or PostgreSQL) stores grain state and the Orleans cluster membership table. This mirrors the Azure SignalR Service topology without any cloud dependency.
+Multiple service nodes behind a load balancer. Clients can connect to any node. Each service node runs an Orleans silo; connection state is held in Orleans grains, and messages between nodes flow via Orleans grain observers (each node registers a local observer with the hub grain). A shared SQL database (SQL Server, PostgreSQL, or MySQL) stores grain state and the Orleans cluster membership table. This mirrors the Azure SignalR Service topology without any cloud dependency.
 
 ```
                     ┌─────────────────┐
@@ -74,11 +74,11 @@ Multiple service nodes behind a load balancer. Clients can connect to any node. 
                │                           │
                └──────────┬────────────────┘
                            ▼
-                  ┌──────────────────┐
-                  │  SQL / PostgreSQL │
-                  │  (grain state +  │
-                  │  cluster table)  │
-                  └──────────────────┘
+                  ┌───────────────────────┐
+                  │ SQL Server / Postgres /│
+                  │ MySQL (grain state +  │
+                  │ cluster table)        │
+                  └───────────────────────┘
 ```
 
 ---

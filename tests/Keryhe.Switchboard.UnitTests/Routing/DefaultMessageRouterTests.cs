@@ -4,14 +4,17 @@ using Keryhe.Switchboard.Core.Models;
 using Keryhe.Switchboard.Registry;
 using Keryhe.Switchboard.Server.Routing;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using Xunit;
 
 namespace Keryhe.Switchboard.UnitTests.Routing;
 
 /// <summary>
-/// D7 (Slice 3): a fan-out target whose negotiated protocol has no matching payload must be
-/// skipped, never sent the wrong bytes — verified directly against the router rather than a full
-/// E2E harness, since it's a pure routing decision.
+/// D7 (Phase 2 Slice 3): a fan-out target whose negotiated protocol has no matching payload must be
+/// skipped, never sent the wrong bytes. D14 (Phase 3 Slice 0): fan-out delivers to this node's own
+/// targets from <see cref="ILocalTransportRegistry"/> — never by enumerating
+/// <see cref="IConnectionRegistry"/> — and then publishes exactly once to <see cref="IBackplane"/>
+/// so every other node can do the same for its own targets.
 /// </summary>
 public class DefaultMessageRouterTests
 {
@@ -20,12 +23,10 @@ public class DefaultMessageRouterTests
     [Fact]
     public async Task BroadcastAsync_SkipsTarget_WhenNoPayloadMatchesItsProtocol()
     {
-        var connectionRegistry = new InMemoryConnectionRegistry();
-        var localTransportRegistry = new LocalTransportRegistry();
-        var router = new DefaultMessageRouter(connectionRegistry, new InMemoryHubRegistry(), localTransportRegistry, NullLogger<DefaultMessageRouter>.Instance);
+        var (router, localTransportRegistry, _) = BuildRouter();
 
-        var (jsonTransport, jsonState) = await RegisterConnectionAsync(connectionRegistry, localTransportRegistry, "json");
-        var (mpTransport, mpState) = await RegisterConnectionAsync(connectionRegistry, localTransportRegistry, "messagepack");
+        var jsonTransport = RegisterConnection(localTransportRegistry, "json");
+        var mpTransport = RegisterConnection(localTransportRegistry, "messagepack");
 
         // Only a json payload is supplied — messagepack has neither a Payloads entry nor a
         // matching fallback (hubProtocol == "json" too), so the mp-negotiated target must be
@@ -41,12 +42,10 @@ public class DefaultMessageRouterTests
     [Fact]
     public async Task BroadcastAsync_SelectsMatchingPayload_PerTargetProtocol()
     {
-        var connectionRegistry = new InMemoryConnectionRegistry();
-        var localTransportRegistry = new LocalTransportRegistry();
-        var router = new DefaultMessageRouter(connectionRegistry, new InMemoryHubRegistry(), localTransportRegistry, NullLogger<DefaultMessageRouter>.Instance);
+        var (router, localTransportRegistry, _) = BuildRouter();
 
-        var (jsonTransport, _) = await RegisterConnectionAsync(connectionRegistry, localTransportRegistry, "json");
-        var (mpTransport, _) = await RegisterConnectionAsync(connectionRegistry, localTransportRegistry, "messagepack");
+        var jsonTransport = RegisterConnection(localTransportRegistry, "json");
+        var mpTransport = RegisterConnection(localTransportRegistry, "messagepack");
 
         var payloads = new Dictionary<string, byte[]>
         {
@@ -63,28 +62,110 @@ public class DefaultMessageRouterTests
         Assert.Equal(new byte[] { 2 }, mpBytes.ToArray());
     }
 
-    private static async Task<(FakeClientTransport Transport, ClientConnectionState State)> RegisterConnectionAsync(
-        IConnectionRegistry connectionRegistry, ILocalTransportRegistry localTransportRegistry, string hubProtocol)
+    [Fact]
+    public async Task BroadcastAsync_DeliversLocally_ThenPublishesToBackplaneExactlyOnce_WithThisNodeId()
+    {
+        var (router, localTransportRegistry, backplane) = BuildRouter(nodeId: "node-a");
+        var transport = RegisterConnection(localTransportRegistry, "json");
+
+        await router.BroadcastAsync(HubName, new byte[] { 9 }, "json", payloadsByProtocol: null, excludedConnectionIds: null, CancellationToken.None);
+
+        // Local delivery happened before the publish — plan decision D14: this node's own clients
+        // are handled from the local index, the backplane reaches every other node's.
+        Assert.True(transport.Output.Reader.TryRead(out _));
+
+        var call = Assert.Single(backplane.Broadcasts);
+        Assert.Equal(HubName, call.HubName);
+        Assert.Equal(new byte[] { 9 }, call.Payload);
+        Assert.Equal("node-a", call.OriginNodeId);
+    }
+
+    [Fact]
+    public async Task SendToGroupAsync_DeliversLocally_ThenPublishesToBackplaneExactlyOnce()
+    {
+        var (router, localTransportRegistry, backplane) = BuildRouter(nodeId: "node-a");
+        var transport = RegisterConnection(localTransportRegistry, "json");
+        localTransportRegistry.AddToGroup(transport.ConnectionId, "room-1");
+
+        await router.SendToGroupAsync(HubName, "room-1", new byte[] { 1 }, "json", payloadsByProtocol: null, excludedConnectionIds: null, CancellationToken.None);
+
+        Assert.True(transport.Output.Reader.TryRead(out _));
+        var call = Assert.Single(backplane.GroupMessages);
+        Assert.Equal("room-1", call.GroupName);
+        Assert.Equal("node-a", call.OriginNodeId);
+    }
+
+    [Fact]
+    public async Task SendToUserAsync_DeliversLocally_ThenPublishesToBackplaneExactlyOnce()
+    {
+        var (router, localTransportRegistry, backplane) = BuildRouter(nodeId: "node-a");
+        var transport = new FakeClientTransport(Guid.NewGuid().ToString("n"), HubName);
+        localTransportRegistry.Register(transport, HubName, "alice");
+        localTransportRegistry.SetHubProtocol(transport.ConnectionId, "json");
+
+        await router.SendToUserAsync(HubName, "alice", new byte[] { 1 }, "json", payloadsByProtocol: null, CancellationToken.None);
+
+        Assert.True(transport.Output.Reader.TryRead(out _));
+        var call = Assert.Single(backplane.UserMessages);
+        Assert.Equal("alice", call.UserId);
+        Assert.Equal("node-a", call.OriginNodeId);
+    }
+
+    [Fact]
+    public async Task RouteToConnectionAsync_LocalHit_WritesDirectly_AndNeverPublishes()
+    {
+        var (router, localTransportRegistry, backplane) = BuildRouter();
+        var transport = RegisterConnection(localTransportRegistry, "json");
+
+        await router.RouteToConnectionAsync(transport.ConnectionId, new byte[] { 5 }, "json", CancellationToken.None);
+
+        Assert.True(transport.Output.Reader.TryRead(out var bytes));
+        Assert.Equal(new byte[] { 5 }, bytes.ToArray());
+        Assert.Empty(backplane.TargetedMessages);
+    }
+
+    [Fact]
+    public async Task RouteToConnectionAsync_LocalMiss_PublishesToBackplane_InsteadOfSilentlyDropping()
+    {
+        var (router, _, backplane) = BuildRouter(nodeId: "node-a");
+
+        await router.RouteToConnectionAsync("connection-on-another-node", new byte[] { 5 }, "json", CancellationToken.None);
+
+        var call = Assert.Single(backplane.TargetedMessages);
+        Assert.Equal("connection-on-another-node", call.ConnectionId);
+        Assert.Equal(new byte[] { 5 }, call.Payload);
+        Assert.Equal("node-a", call.OriginNodeId);
+    }
+
+    private static (DefaultMessageRouter Router, ILocalTransportRegistry LocalTransportRegistry, RecordingBackplane Backplane) BuildRouter(string nodeId = "node-under-test")
+    {
+        var connectionRegistry = new InMemoryConnectionRegistry();
+        var localTransportRegistry = new LocalTransportRegistry();
+        var backplane = new RecordingBackplane();
+        var options = Options.Create(new SwitchboardOptions
+        {
+            PublicUrl = "https://localhost",
+            TokenSigningKey = "test-token-signing-key-0123456789",
+            ServerSigningKey = "test-server-signing-key-0123456789",
+            NodeId = nodeId,
+        });
+
+        var router = new DefaultMessageRouter(
+            connectionRegistry, new InMemoryHubRegistry(), localTransportRegistry, backplane, options,
+            NullLogger<DefaultMessageRouter>.Instance);
+
+        return (router, localTransportRegistry, backplane);
+    }
+
+    private static FakeClientTransport RegisterConnection(ILocalTransportRegistry localTransportRegistry, string hubProtocol)
     {
         var connectionId = Guid.NewGuid().ToString("n");
         var transport = new FakeClientTransport(connectionId, HubName);
 
-        var state = new ClientConnectionState
-        {
-            ConnectionId = connectionId,
-            ConnectionToken = Guid.NewGuid().ToString("n"),
-            HubName = HubName,
-            Transport = TransportType.WebSockets,
-            TransportHandle = transport,
-            ServerConnectionId = "server-1",
-            ConnectedAt = DateTimeOffset.UtcNow,
-        };
+        localTransportRegistry.Register(transport, HubName, userId: null);
+        localTransportRegistry.SetHubProtocol(connectionId, hubProtocol);
 
-        await connectionRegistry.RegisterAsync(state, CancellationToken.None);
-        await connectionRegistry.SetProtocolAsync(connectionId, hubProtocol, CancellationToken.None);
-        localTransportRegistry.Register(transport);
-
-        return (transport, state);
+        return transport;
     }
 
     private sealed class FakeClientTransport(string connectionId, string hubName) : IClientTransport
@@ -97,5 +178,48 @@ public class DefaultMessageRouterTests
         public IAsyncEnumerable<ReadOnlyMemory<byte>> ReadAllAsync(CancellationToken ct) => throw new NotSupportedException();
 
         public ValueTask CloseAsync(string? error = null) => ValueTask.CompletedTask;
+    }
+
+    /// <summary>Records every publish call rather than asserting on a live backplane implementation
+    /// — Slice 0 has none yet (Slice 2 adds the Orleans one); this is what proves the router's own
+    /// "local first, then publish once" contract independent of any real backplane.</summary>
+    private sealed class RecordingBackplane : IBackplane
+    {
+        public List<(string HubName, byte[] Payload, string HubProtocol, IReadOnlyDictionary<string, byte[]>? PayloadsByProtocol, string[] ExcludedConnectionIds, string OriginNodeId)> Broadcasts { get; } = [];
+        public List<(string HubName, string GroupName, byte[] Payload, string HubProtocol, IReadOnlyDictionary<string, byte[]>? PayloadsByProtocol, string[] ExcludedConnectionIds, string OriginNodeId)> GroupMessages { get; } = [];
+        public List<(string HubName, string UserId, byte[] Payload, string HubProtocol, IReadOnlyDictionary<string, byte[]>? PayloadsByProtocol, string OriginNodeId)> UserMessages { get; } = [];
+        public List<(string ConnectionId, byte[] Payload, string HubProtocol, string OriginNodeId)> TargetedMessages { get; } = [];
+
+        public Task PublishBroadcastAsync(string hubName, byte[] payload, string hubProtocol, IReadOnlyDictionary<string, byte[]>? payloadsByProtocol, string[] excludedConnectionIds, string originNodeId, CancellationToken ct)
+        {
+            Broadcasts.Add((hubName, payload, hubProtocol, payloadsByProtocol, excludedConnectionIds, originNodeId));
+            return Task.CompletedTask;
+        }
+
+        public Task PublishGroupMessageAsync(string hubName, string groupName, byte[] payload, string hubProtocol, IReadOnlyDictionary<string, byte[]>? payloadsByProtocol, string[] excludedConnectionIds, string originNodeId, CancellationToken ct)
+        {
+            GroupMessages.Add((hubName, groupName, payload, hubProtocol, payloadsByProtocol, excludedConnectionIds, originNodeId));
+            return Task.CompletedTask;
+        }
+
+        public Task PublishUserMessageAsync(string hubName, string userId, byte[] payload, string hubProtocol, IReadOnlyDictionary<string, byte[]>? payloadsByProtocol, string originNodeId, CancellationToken ct)
+        {
+            UserMessages.Add((hubName, userId, payload, hubProtocol, payloadsByProtocol, originNodeId));
+            return Task.CompletedTask;
+        }
+
+        public Task PublishToConnectionAsync(string connectionId, byte[] payload, string hubProtocol, string originNodeId, CancellationToken ct)
+        {
+            TargetedMessages.Add((connectionId, payload, hubProtocol, originNodeId));
+            return Task.CompletedTask;
+        }
+
+        public Task PublishServerEnvelopeAsync(string hubName, string serverConnectionRef, byte[] serializedEnvelope, CancellationToken ct) => Task.CompletedTask;
+
+        public Task PublishCloseConnectionAsync(string connectionId, string? error, bool allowReconnect, string originNodeId, CancellationToken ct) => Task.CompletedTask;
+
+        public Task PublishAddToGroupAsync(string connectionId, string groupName, string originNodeId, CancellationToken ct) => Task.CompletedTask;
+
+        public Task PublishRemoveFromGroupAsync(string connectionId, string groupName, string originNodeId, CancellationToken ct) => Task.CompletedTask;
     }
 }

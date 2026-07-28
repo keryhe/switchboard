@@ -79,7 +79,7 @@ Each service instance registers a local `HubObserverImpl` (an `IHubObserver` / `
 - The `IConnectionRegistry` interface must be async from Phase 1, even though in-memory operations are synchronous. This ensures Phase 3 substitution requires no interface changes.
 - The in-memory implementation must **not** store `IClientTransport` references in any way that could be confused with distributed state — transport handles are always local-node concerns.
 - Orleans grain interfaces (`IHubGrain`, `IGroupGrain`, `IUserGrain`, `IConnectionGrain`) and the `IHubObserver` observer interface are defined in `Keryhe.Switchboard.Orleans` and are called by `OrleansConnectionRegistry` and `OrleansObserverBackplane`.
-- Grain state persistence requires a storage provider. `Microsoft.Orleans.Persistence.AdoNet` (SQL Server or PostgreSQL) is recommended for production. `Microsoft.Orleans.Persistence.Memory` is used in development and single-node mode.
+- Grain state persistence requires a storage provider. `Microsoft.Orleans.Persistence.AdoNet` (SQL Server, PostgreSQL, or MySQL) is recommended for production. `Microsoft.Orleans.Persistence.Memory` is used in development and single-node mode.
 
 ---
 

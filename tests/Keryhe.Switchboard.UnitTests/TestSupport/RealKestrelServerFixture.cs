@@ -31,6 +31,11 @@ public sealed class RealKestrelServerFixture : IAsyncDisposable
         {
             "--urls", url,
             "--Switchboard:PublicUrl", url,
+            // Same loopback address as PublicUrl by default — good enough for a test process where
+            // every node lives in the same machine's port space. D19's forward hop (Phase 3 Slice 5)
+            // needs a real, reachable InternalUrl per node; extraArgs can still override this per
+            // fixture instance if a test needs to simulate InternalUrl being unset.
+            "--Switchboard:InternalUrl", url,
             "--Switchboard:TokenSigningKey", "dev-only-client-signing-key-change-me-32+",
             "--Switchboard:ServerSigningKey", "dev-only-server-signing-key-change-me-32+",
         }.Concat(extraArgs).ToArray();
@@ -42,7 +47,9 @@ public sealed class RealKestrelServerFixture : IAsyncDisposable
         ServerAddress = new Uri(addresses.First());
     }
 
-    private static int GetFreeTcpPort()
+    /// <summary>Public so multi-node tests (Phase 3 Slice 2) can allocate additional free ports —
+    /// the Orleans silo/gateway ports — beyond the one this fixture already picks for HTTP.</summary>
+    public static int GetFreeTcpPort()
     {
         var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
         listener.Start();

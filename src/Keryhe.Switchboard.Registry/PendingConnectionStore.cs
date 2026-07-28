@@ -15,16 +15,20 @@ public sealed record PendingConnection(
 /// identifies, bridging the gap between negotiate and the transport upgrade (see plan D4). A
 /// transport upgrade presenting an unknown or expired token must get 404/401, never a new
 /// connection, so entries are removed on first (successful) consumption and reaped on expiry.
+/// Async — not because the in-memory implementation needs it, but because the Orleans
+/// implementation (plan decision D19, Phase 3 Slice 1) is grain-backed and a synchronous facade
+/// over a grain call is a sync-over-async deadlock risk in request-handling code. Mirrors
+/// <see cref="IConnectionRegistry"/>'s own "async from day one" posture (ADR-002) for the same reason.
 /// </summary>
 public interface IPendingConnectionStore
 {
-    void Add(PendingConnection pending);
+    Task AddAsync(PendingConnection pending, CancellationToken ct = default);
 
     /// <summary>Removes and returns the entry if present and not expired; otherwise returns null (including for expired-but-not-yet-reaped entries).</summary>
-    PendingConnection? TryConsume(string connectionToken);
+    Task<PendingConnection?> TryConsumeAsync(string connectionToken, CancellationToken ct = default);
 
     /// <summary>Evicts all expired entries. Intended to be called periodically by a background reaper.</summary>
-    void ReapExpired();
+    Task ReapExpiredAsync(CancellationToken ct = default);
 }
 
 public sealed class InMemoryPendingConnectionStore(TimeProvider timeProvider) : IPendingConnectionStore
@@ -35,19 +39,23 @@ public sealed class InMemoryPendingConnectionStore(TimeProvider timeProvider) : 
     {
     }
 
-    public void Add(PendingConnection pending) => _pending[pending.ConnectionToken] = pending;
+    public Task AddAsync(PendingConnection pending, CancellationToken ct = default)
+    {
+        _pending[pending.ConnectionToken] = pending;
+        return Task.CompletedTask;
+    }
 
-    public PendingConnection? TryConsume(string connectionToken)
+    public Task<PendingConnection?> TryConsumeAsync(string connectionToken, CancellationToken ct = default)
     {
         if (!_pending.TryRemove(connectionToken, out var pending))
         {
-            return null;
+            return Task.FromResult<PendingConnection?>(null);
         }
 
-        return pending.ExpiresAt > timeProvider.GetUtcNow() ? pending : null;
+        return Task.FromResult(pending.ExpiresAt > timeProvider.GetUtcNow() ? pending : null);
     }
 
-    public void ReapExpired()
+    public Task ReapExpiredAsync(CancellationToken ct = default)
     {
         var now = timeProvider.GetUtcNow();
         foreach (var (token, pending) in _pending)
@@ -57,5 +65,7 @@ public sealed class InMemoryPendingConnectionStore(TimeProvider timeProvider) : 
                 _pending.TryRemove(token, out _);
             }
         }
+
+        return Task.CompletedTask;
     }
 }

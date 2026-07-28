@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Orleans.Server" Version="10.2.2" />
+    <PackageReference Include="Microsoft.Orleans.Clustering.AdoNet" Version="10.2.2" />
+    <PackageReference Include="Microsoft.Orleans.Persistence.AdoNet" Version="10.2.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Keryhe.Switchboard.Core\Keryhe.Switchboard.Core.csproj" />
+    <ProjectReference Include="..\Keryhe.Switchboard.Protocol\Keryhe.Switchboard.Protocol.csproj" />
+    <ProjectReference Include="..\Keryhe.Switchboard.Registry\Keryhe.Switchboard.Registry.csproj" />
+  </ItemGroup>
+
+</Project>

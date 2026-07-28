@@ -16,7 +16,6 @@ public sealed class ClientConnectionState
     // Transport & Protocol
     public required TransportType Transport { get; init; }
     public string? HubProtocol { get; set; }
-    public required IClientTransport TransportHandle { get; init; }
 
     // Routing
     public required string ServerConnectionId { get; set; }

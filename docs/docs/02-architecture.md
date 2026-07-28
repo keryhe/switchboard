@@ -21,8 +21,8 @@ graph TB
         SC[Server Connection Manager]
         JWT[JWT Token Authority]
         MGMT[Management REST API]
-        subgraph Orleans["Orleans Silo (Phase 3)"]
-            OG[Hub / Group / User / Connection Grains]
+        subgraph Orleans["Orleans Silo (Phase 3, implemented)"]
+            OG[Hub / Connection / Node Registry Grains]
             OS[Grain Observers<br/>Backplane]
             OM[Cluster Membership]
         end
@@ -133,21 +133,25 @@ Used by the Message Router to find a server connection when routing a client mes
 
 ---
 
-### Orleans Silo (Phase 3)
+### Orleans Silo (Phase 3, implemented)
 
 **Responsibility:** Hosts the distributed grain actors that provide shared state and message routing across service nodes in a clustered deployment. The silo runs co-located within each service node process — there is no separate Orleans server.
 
-**Grain types:**
-- `IHubGrain` — authoritative list of all `{connectionId, nodeId}` pairs for a hub; coordinates broadcast fan-out
-- `IGroupGrain` — group membership set; coordinates group fan-out
-- `IUserGrain` — per-user connection set; coordinates user-targeted messages
-- `IConnectionGrain` — maps a `connectionId` to its owning node ID; used for targeted `send_to_connection`
+**Grain types (as implemented):**
+- `IHubGrain` — per-hub client-connection membership (backs diagnostics, not the fan-out hot path); the cluster-wide server-connection inventory and least-loaded assignment (Phase 3 Slice 4, plan decision D18); and the observer subscriptions that make it the backplane's cross-silo fan-out coordinator for the hub
+- `IConnectionGrain` — maps a `connectionId` to its owning node ID and full record; used for targeted `send_to_connection`, for resolving where a cross-node `AddToGroup`/`RemoveFromGroup`/`CloseConnection` actually needs to land, and for the group/user grain updates below
+- `IGroupGrain` / `IUserGrain` — authoritative membership sets, consulted for management-API queries and disconnect cleanup — **never** on the fan-out path (see below)
+- `INodeRegistryGrain` — each node's `InternalUrl`, published at startup and removed at shutdown; backs the SSE/Long Polling internal forward hop (Phase 3 Slice 5, plan decision D19)
+- `IConnectionTokenOwnerGrain` — keyed by the opaque `connectionToken` itself, tracks which node claimed an SSE/Long Polling transport (see the `connectionToken` correction note in [03-protocol.md §1.1](03-protocol.md))
+- `IPendingConnectionGrain` — the step-2-negotiate-to-transport-upgrade bridge (`IPendingConnectionStore`), made a grain from Phase 3 Slice 1 onward so a client can negotiate on one node and open its transport on another
 
-**Grain observers** serve as the backplane channel: each node registers a local `HubObserverImpl` (an `IHubObserver` / `IGrainObserver`) with the relevant hub grain at startup. Broadcasts and group/user messages are delivered by the grain calling each registered observer directly (skipping the origin node); each observer delivers to local client transports via `ILocalTransportRegistry`. See [ADR-003](07-adr/ADR-003-backplane.md) and [Design §7](04-design.md#7-backplane-design-phase-3).
+**Fan-out never queries a membership grain, even though one exists:** group and user *sends* are published **by name** (plan decision D17) — `IHubGrain`'s broadcast/group/user fan-out calls every subscribed node's observer, and each node resolves membership (who's actually in that group, locally) and per-protocol payload selection against its own node-local `ILocalTransportRegistry` cache, not `IGroupGrain`/`IUserGrain` — a grain round trip on every message would be far too slow. Keeping that node-local cache in sync when a client's assigned app server lives on a different node than the client itself is exactly what a Phase 3 Slice 7 bug fix had to add (an `AddToGroup`/`RemoveFromGroup` envelope forwarded to the connection's actual node when it isn't local — see [00-review-findings.md § Phase 3 Results](00-review-findings.md#phase-3-scale-out--resilience-results-2026-07-28)).
 
-**Cluster membership** is stored in a shared SQL table (SQL Server or PostgreSQL via `Microsoft.Orleans.Clustering.AdoNet`). This allows nodes to join and leave the cluster without manual coordination.
+**Grain observers** serve as the backplane channel: each node registers a local `HubObserverImpl` (an `IHubObserver` / `IGrainObserver`) with the relevant hub grain, not just once at startup but on a recurring heartbeat (`ObserverHeartbeatService`, plan decision D16) — a hub grain deactivation silently drops every subscription with no error anywhere, so periodic re-subscription is what makes delivery self-heal rather than requiring an operator restart. Broadcasts and group/user messages are delivered by the grain calling each registered observer directly (skipping the origin node); each observer delivers to local client transports via `ILocalTransportRegistry`. See [ADR-003](07-adr/ADR-003-backplane.md) and [Design §7](04-design.md#7-backplane-design-phase-3).
 
-**Single-node mode:** The Orleans silo runs with in-memory storage and in-memory clustering. No SQL dependency. Phase 3 features are unlocked by switching to the ADO.NET providers via configuration.
+**Cluster membership** is stored in a shared SQL table (SQL Server, PostgreSQL, or MySQL via `Microsoft.Orleans.Clustering.AdoNet`) — schema vendored under `Keryhe.Switchboard.Orleans/Sql/` (the packages don't ship it), with driver selection a host-level DI concern rather than a dependency the Orleans project itself takes on. This allows nodes to join and leave the cluster without manual coordination.
+
+**Single-node mode:** The Orleans silo runs with in-memory storage and in-memory clustering. No SQL dependency. Clustered/multi-node features are unlocked by switching to the ADO.NET providers via configuration (`UseOrleansCluster = true`) — both modes are maintained and tested, not just the clustered one.
 
 ---
 
@@ -266,7 +270,7 @@ sequenceDiagram
 
 ---
 
-### 4. Scale-Out Routing (Clustered — Phase 3)
+### 4. Scale-Out Routing (Clustered — Phase 3, implemented)
 
 ```mermaid
 sequenceDiagram
@@ -297,4 +301,4 @@ sequenceDiagram
 
 3. **Backpressure-aware fan-out.** Broadcast fan-out uses `System.IO.Pipelines` and does not block the router awaiting slow clients. Slow clients accumulate backpressure; the service drops or closes connections that cannot keep up (configurable policy).
 
-4. **Stateless service nodes (Phase 3).** In clustered mode, no connection state is local-only. Any node can answer a management API query about any connection. Nodes are interchangeable and can be replaced without coordinated shutdown.
+4. **Stateless-enough service nodes (Phase 3).** In clustered mode, *authoritative* connection state (who owns what, cluster-wide server-connection assignment, group/user membership by name) lives in grains, not on any one node — any node can answer a management API query about any connection, and a node can be restarted without an operator coordinating anything (Phase 3 Slice 7's own milestone). What deliberately stays node-local and is never replicated to grain state: the physical transport handle itself (`IClientTransport`, `ILocalTransportRegistry`) and the node-local hub/group/user membership indexes used to resolve fan-out without a distributed lookup (plan decision D14) — a live socket is only ever meaningful on the one node that physically holds it.

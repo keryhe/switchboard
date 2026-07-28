@@ -26,10 +26,14 @@ public static class LongPollingClientEndpoint
         IConnectionRegistry connectionRegistry,
         ILocalTransportRegistry localTransportRegistry,
         ClientConnectionManager connectionManager,
+        IHubRegistry hubRegistry,
         IServerConnectionSelector serverConnectionSelector,
+        IBackplane backplane,
         IMessageRouter router,
         IOptions<SwitchboardOptions> options,
-        LongPollingConnectionTracker tracker)
+        LongPollingConnectionTracker tracker,
+        ClientConnectionForwarder forwarder,
+        ITransportOwnershipRegistry ownershipRegistry)
     {
         var connectionToken = context.Request.Query["id"].ToString();
 
@@ -39,9 +43,23 @@ public static class LongPollingClientEndpoint
             return;
         }
 
+        // Not local. Two possibilities: a genuinely new connectionToken that has never been
+        // established anywhere (proceed to HandleEstablishAsync, legal from any node since Slice
+        // 1's pending-connection grain is cluster-wide), or an already-established connection whose
+        // poll landed on a node other than the one holding its transport (plan decision D19) —
+        // distinguished by resolving connectionToken against ITransportOwnershipRegistry, claimed by
+        // whichever node's GET actually established it. Only the latter forwards; the former must
+        // never be forwarded, since establishing here is exactly as legal as establishing anywhere
+        // else.
+        if (await forwarder.TryForwardAsync(context, connectionToken, context.RequestAborted))
+        {
+            return;
+        }
+
         await HandleEstablishAsync(
             context, hub, connectionToken, tokenService, pendingConnections, connectionRegistry,
-            localTransportRegistry, connectionManager, serverConnectionSelector, router, options, tracker);
+            localTransportRegistry, connectionManager, hubRegistry, serverConnectionSelector, backplane, router, options, tracker,
+            ownershipRegistry);
     }
 
     private static async Task HandlePollAsync(
@@ -97,13 +115,16 @@ public static class LongPollingClientEndpoint
         IConnectionRegistry connectionRegistry,
         ILocalTransportRegistry localTransportRegistry,
         ClientConnectionManager connectionManager,
+        IHubRegistry hubRegistry,
         IServerConnectionSelector serverConnectionSelector,
+        IBackplane backplane,
         IMessageRouter router,
         IOptions<SwitchboardOptions> options,
-        LongPollingConnectionTracker tracker)
+        LongPollingConnectionTracker tracker,
+        ITransportOwnershipRegistry ownershipRegistry)
     {
-        var result = ClientConnectionValidation.Establish(
-            context, hub, connectionToken, tokenService, pendingConnections, serverConnectionSelector);
+        var result = await ClientConnectionValidation.EstablishAsync(
+            context, hub, connectionToken, tokenService, pendingConnections, serverConnectionSelector, options.Value.NodeId);
         if (!result.Success)
         {
             context.Response.StatusCode = result.ErrorStatusCode!.Value;
@@ -111,7 +132,7 @@ public static class LongPollingClientEndpoint
         }
 
         var pending = result.Pending!;
-        var serverConnectionState = result.ServerConnectionState!;
+        var serverConnectionRef = result.ServerConnectionRef!;
 
         var transport = new LongPollingClientTransport(
             pending.ConnectionId, hub, pending.UserId,
@@ -120,9 +141,15 @@ public static class LongPollingClientEndpoint
         connectionManager.RegisterTransport(connectionToken, transport);
         tracker.Register(connectionToken, transport);
 
+        // Claimed before the establishing GET's response is sent (plan decision D19) — the
+        // handshake POST that follows can arrive on another node the instant this response reaches
+        // the client, and it must already be able to resolve this node as the owner.
+        await ownershipRegistry.ClaimAsync(connectionToken, options.Value.NodeId, context.RequestAborted);
+
         RunConnectionLifecycle(
             transport, pending, connectionToken, hub, connectionRegistry, localTransportRegistry,
-            connectionManager, tracker, serverConnectionState, router, options.Value.ClientKeepAliveInterval);
+            connectionManager, tracker, hubRegistry, serverConnectionSelector, backplane, serverConnectionRef,
+            options.Value.NodeId, router, options.Value.ClientKeepAliveInterval, ownershipRegistry);
 
         context.Response.StatusCode = StatusCodes.Status200OK;
     }
@@ -139,9 +166,14 @@ public static class LongPollingClientEndpoint
         ILocalTransportRegistry localTransportRegistry,
         ClientConnectionManager connectionManager,
         LongPollingConnectionTracker tracker,
-        ServerConnectionState serverConnectionState,
+        IHubRegistry hubRegistry,
+        IServerConnectionSelector serverConnectionSelector,
+        IBackplane backplane,
+        string serverConnectionRef,
+        string localNodeId,
         IMessageRouter router,
-        TimeSpan keepAliveInterval)
+        TimeSpan keepAliveInterval,
+        ITransportOwnershipRegistry ownershipRegistry)
     {
         _ = Task.Run(async () =>
         {
@@ -162,13 +194,15 @@ public static class LongPollingClientEndpoint
                 var connection = new ClientConnection(pending.ConnectionId, connectionToken, hub, pending.UserId, transport, protocol);
 
                 await ClientConnectionLifecycle.RunAsync(
-                    connection, pending, enumerator, connectionRegistry, localTransportRegistry,
-                    connectionManager, serverConnectionState, router, keepAliveInterval, CancellationToken.None);
+                    connection, pending, enumerator, TransportType.LongPolling, connectionRegistry, localTransportRegistry,
+                    connectionManager, hubRegistry, serverConnectionSelector, backplane, serverConnectionRef, localNodeId,
+                    router, keepAliveInterval, CancellationToken.None);
             }
             finally
             {
                 connectionManager.UnregisterTransport(connectionToken);
                 tracker.Unregister(connectionToken);
+                await ownershipRegistry.ReleaseAsync(connectionToken, CancellationToken.None);
             }
         });
     }

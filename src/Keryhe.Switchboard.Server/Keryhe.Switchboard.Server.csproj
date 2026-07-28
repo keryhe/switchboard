@@ -8,12 +8,16 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.0" />
     <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.2.1" />
+    <!-- The reference ADO.NET driver this host ships configured out of the box (Phase 3 Slice 6) —
+         see Keryhe.Switchboard.Orleans/Sql/README.md for how to swap in SQL Server/MySQL instead. -->
+    <PackageReference Include="Npgsql" Version="10.0.3" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Keryhe.Switchboard.Core\Keryhe.Switchboard.Core.csproj" />
     <ProjectReference Include="..\Keryhe.Switchboard.Protocol\Keryhe.Switchboard.Protocol.csproj" />
     <ProjectReference Include="..\Keryhe.Switchboard.Registry\Keryhe.Switchboard.Registry.csproj" />
+    <ProjectReference Include="..\Keryhe.Switchboard.Orleans\Keryhe.Switchboard.Orleans.csproj" />
   </ItemGroup>
 
 </Project>

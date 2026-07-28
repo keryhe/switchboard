@@ -23,16 +23,20 @@ public static class ClientEndpoints
         IConnectionRegistry connectionRegistry,
         ILocalTransportRegistry localTransportRegistry,
         ClientConnectionManager connectionManager,
+        IHubRegistry hubRegistry,
         IServerConnectionSelector serverConnectionSelector,
+        IBackplane backplane,
         IMessageRouter router,
         IOptions<SwitchboardOptions> options,
-        LongPollingConnectionTracker longPollingTracker)
+        LongPollingConnectionTracker longPollingTracker,
+        ClientConnectionForwarder forwarder,
+        ITransportOwnershipRegistry ownershipRegistry)
     {
         if (context.WebSockets.IsWebSocketRequest)
         {
             await ClientConnectionEndpoint.HandleAsync(
                 context, hub, tokenService, pendingConnections, connectionRegistry,
-                localTransportRegistry, connectionManager, serverConnectionSelector, router, options);
+                localTransportRegistry, connectionManager, hubRegistry, serverConnectionSelector, backplane, router, options);
             return;
         }
 
@@ -40,20 +44,23 @@ public static class ClientEndpoints
         {
             await SseClientEndpoint.HandleGetAsync(
                 context, hub, tokenService, pendingConnections, connectionRegistry,
-                localTransportRegistry, connectionManager, serverConnectionSelector, router, options);
+                localTransportRegistry, connectionManager, hubRegistry, serverConnectionSelector, backplane, router, options,
+                ownershipRegistry);
             return;
         }
 
         await LongPollingClientEndpoint.HandleGetAsync(
             context, hub, tokenService, pendingConnections, connectionRegistry,
-            localTransportRegistry, connectionManager, serverConnectionSelector, router, options, longPollingTracker);
+            localTransportRegistry, connectionManager, hubRegistry, serverConnectionSelector, backplane, router, options,
+            longPollingTracker, forwarder, ownershipRegistry);
     }
 
     public static async Task HandlePostAsync(
         HttpContext context,
         string hub,
         ITokenService tokenService,
-        ClientConnectionManager connectionManager)
+        ClientConnectionManager connectionManager,
+        ClientConnectionForwarder forwarder)
     {
         var principal = ClientConnectionValidation.ValidateAccessToken(context, hub, tokenService);
         if (principal is null)
@@ -65,6 +72,13 @@ public static class ClientEndpoints
         var connectionToken = context.Request.Query["id"].ToString();
         if (connectionManager.GetTransportByToken(connectionToken) is not IPostableClientTransport transport)
         {
+            // Not on this node — may be owned by another node under D19 (SSE/Long Polling's POST
+            // can land anywhere) rather than genuinely gone.
+            if (await forwarder.TryForwardAsync(context, connectionToken, context.RequestAborted))
+            {
+                return;
+            }
+
             context.Response.StatusCode = StatusCodes.Status404NotFound;
             return;
         }
@@ -81,7 +95,8 @@ public static class ClientEndpoints
         HttpContext context,
         string hub,
         ITokenService tokenService,
-        ClientConnectionManager connectionManager)
+        ClientConnectionManager connectionManager,
+        ClientConnectionForwarder forwarder)
     {
         var principal = ClientConnectionValidation.ValidateAccessToken(context, hub, tokenService);
         if (principal is null)
@@ -94,6 +109,11 @@ public static class ClientEndpoints
         var transport = connectionManager.GetTransportByToken(connectionToken);
         if (transport is null)
         {
+            if (await forwarder.TryForwardAsync(context, connectionToken, context.RequestAborted))
+            {
+                return;
+            }
+
             context.Response.StatusCode = StatusCodes.Status404NotFound;
             return;
         }

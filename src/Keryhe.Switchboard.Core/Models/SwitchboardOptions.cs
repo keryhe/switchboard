@@ -58,4 +58,44 @@ public sealed class SwitchboardOptions
     public string? OrleansAdoNetInvariant { get; set; }
     public string OrleansClusterId { get; set; } = "switchboard";
     public string OrleansServiceId { get; set; } = "switchboard";
+
+    /// <summary>GUID per process by default (plan decision D14); override for a stable id across
+    /// restarts if a deployment wants one. Used as <c>originNodeId</c> on every backplane publish
+    /// and, once server-connection assignment is cluster-wide (plan decision D18), as half of a
+    /// node-qualified <c>ServerConnectionId</c> (see <see cref="Keryhe.Switchboard.Core.ServerConnectionRef"/>).</summary>
+    public string NodeId { get; set; } = Guid.NewGuid().ToString("n");
+
+    /// <summary>This node's address on the internal cluster network — used for the SSE/Long
+    /// Polling owner-forward hop (plan decision D19, Phase 3 Slice 5). Not required for single-node
+    /// or WebSocket-only deployments.</summary>
+    public string? InternalUrl { get; set; }
+
+    /// <summary>Every node re-subscribes to every hub grain it locally knows about on this cadence
+    /// (plan decision D16) — this, not grain-side persistence, is what survives a hub grain
+    /// deactivation (verified: an idle grain silently drops every observer subscription — finding
+    /// 5) and what an evicted-after-failure node needs to recover cross-node delivery without a
+    /// restart.</summary>
+    public TimeSpan ObserverHeartbeatInterval { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Test-only: <c>UseLocalhostClustering()</c>'s dev/single-node clustering provider
+    /// binds fixed default ports, so running two silos in one process (Phase 3 Slice 2's two-node
+    /// tests) needs each given its own. Null in every real deployment — a real multi-node cluster
+    /// uses the ADO.NET providers (Phase 3 Slice 6), never localhost clustering at all.</summary>
+    public int? OrleansSiloPort { get; set; }
+
+    /// <summary>Paired with <see cref="OrleansSiloPort"/> — see its remarks.</summary>
+    public int? OrleansGatewayPort { get; set; }
+
+    /// <summary>Test-only, paired with <see cref="OrleansSiloPort"/>: the primary silo's
+    /// "ip:port" endpoint a secondary test silo joins. Null for the primary silo itself.</summary>
+    public string? OrleansPrimarySiloEndpoint { get; set; }
+
+    /// <summary>How often <c>OrleansReadinessProbe</c> (Phase 3 Slice 7) recomputes the cached
+    /// value <c>/healthz</c> answers from — silo status plus a cluster-wide server-connection check
+    /// per locally-known hub. Deliberately not answered per-request: a load balancer probes every
+    /// node every couple of seconds, and doing grain I/O inline would make the probe itself fail
+    /// exactly when the cluster is unwell. 1-2s per the plan; kept short enough that a real outage
+    /// is reflected within roughly one probe interval, long enough that a load-balancer's probing
+    /// cadence never turns into a grain-call storm.</summary>
+    public TimeSpan HealthCheckCacheInterval { get; set; } = TimeSpan.FromSeconds(1);
 }

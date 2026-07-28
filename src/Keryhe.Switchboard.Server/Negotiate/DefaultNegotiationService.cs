@@ -27,11 +27,11 @@ public sealed class DefaultNegotiationService(
         return Task.FromResult(new RedirectResponse { Url = url, AccessToken = accessToken });
     }
 
-    public Task<NegotiateResponse> NegotiateAsync(string hubName, ClaimsPrincipal accessToken, CancellationToken ct)
+    public async Task<NegotiateResponse> NegotiateAsync(string hubName, ClaimsPrincipal accessToken, CancellationToken ct)
     {
         // D5: fail fast rather than wait/queue — this is the earliest point the service knows
         // whether any app server can service the hub.
-        if (!hubRegistry.HasActiveServerConnection(hubName))
+        if (!await hubRegistry.HasActiveServerConnectionAsync(hubName, ct))
         {
             throw new NoServerConnectionException(hubName);
         }
@@ -47,13 +47,13 @@ public sealed class DefaultNegotiationService(
             .Where(c => c.Type is not ("connectionId" or "hubName" or "sub" or "exp" or "iat" or "nbf" or "iss" or "aud"))
             .ToDictionary(c => c.Type, c => c.Value);
 
-        pendingConnections.Add(new PendingConnection(
+        await pendingConnections.AddAsync(new PendingConnection(
             connectionToken,
             connectionId,
             hubName,
             userId,
             claims.Count > 0 ? claims : null,
-            DateTimeOffset.UtcNow.Add(_options.ClientTokenExpiry)));
+            DateTimeOffset.UtcNow.Add(_options.ClientTokenExpiry)), ct);
 
         // All three transports are implemented (plan §4 Slices 4-6). SSE is Text-only since it
         // cannot carry MessagePack's binary frames; Long Polling is plain request/response bodies
@@ -71,7 +71,7 @@ public sealed class DefaultNegotiationService(
             ],
         };
 
-        return Task.FromResult(response);
+        return response;
     }
 
     private static string GenerateOpaqueToken() => Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();

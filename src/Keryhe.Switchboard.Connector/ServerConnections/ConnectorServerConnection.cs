@@ -47,6 +47,19 @@ public sealed class ConnectorServerConnection : IAsyncDisposable
 
     public bool IsOpen => _socket.State == WebSocketState.Open;
 
+    /// <summary>
+    /// <paramref name="ct"/> bounds the wait for the write lock but deliberately does NOT reach the
+    /// socket write — the app-server end of the same rule <c>WebSocketServerConnection.SendAsync</c>
+    /// documents on the service end.
+    /// </summary>
+    /// <remarks>
+    /// Cancelling an in-flight WebSocket send aborts the whole socket, and this socket is shared by
+    /// every client this app server hosts for the hub — one pool slot serving all of them. Per-client
+    /// tokens genuinely arrive here: a hub method's own <c>CancellationToken</c> flows through
+    /// <c>SwitchboardHubLifetimeManager</c>, and <c>InboundDispatcher.RunOutboundReaderAsync</c>
+    /// passes its per-connection token to <c>sendToService</c>. Letting either abort the pool
+    /// connection would drop every other client's messages until it reconnected.
+    /// </remarks>
     public async ValueTask SendAsync(ServerEnvelope envelope, CancellationToken ct)
     {
         await _writeLock.WaitAsync(ct);
@@ -54,7 +67,7 @@ public sealed class ConnectorServerConnection : IAsyncDisposable
         {
             var buffer = new ArrayBufferWriter<byte>();
             ServerEnvelopeSerializer.Write(buffer, envelope);
-            await _socket.SendAsync(buffer.WrittenMemory, WebSocketMessageType.Binary, endOfMessage: true, ct);
+            await _socket.SendAsync(buffer.WrittenMemory, WebSocketMessageType.Binary, endOfMessage: true, _cts.Token);
         }
         finally
         {

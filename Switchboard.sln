@@ -27,6 +27,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "SampleChatApp", "SampleChat
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SampleChatApp.Api", "samples\SampleChatApp\SampleChatApp.Api\SampleChatApp.Api.csproj", "{5C04357D-05E2-43EB-B4D7-D8527BC3E87D}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Keryhe.Switchboard.Orleans", "src\Keryhe.Switchboard.Orleans\Keryhe.Switchboard.Orleans.csproj", "{25218C28-5C77-4F9D-81C6-9E7D8257CA5E}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -133,6 +135,18 @@ Global
 		{5C04357D-05E2-43EB-B4D7-D8527BC3E87D}.Release|x64.Build.0 = Release|Any CPU
 		{5C04357D-05E2-43EB-B4D7-D8527BC3E87D}.Release|x86.ActiveCfg = Release|Any CPU
 		{5C04357D-05E2-43EB-B4D7-D8527BC3E87D}.Release|x86.Build.0 = Release|Any CPU
+		{25218C28-5C77-4F9D-81C6-9E7D8257CA5E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{25218C28-5C77-4F9D-81C6-9E7D8257CA5E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{25218C28-5C77-4F9D-81C6-9E7D8257CA5E}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{25218C28-5C77-4F9D-81C6-9E7D8257CA5E}.Debug|x64.Build.0 = Debug|Any CPU
+		{25218C28-5C77-4F9D-81C6-9E7D8257CA5E}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{25218C28-5C77-4F9D-81C6-9E7D8257CA5E}.Debug|x86.Build.0 = Debug|Any CPU
+		{25218C28-5C77-4F9D-81C6-9E7D8257CA5E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{25218C28-5C77-4F9D-81C6-9E7D8257CA5E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{25218C28-5C77-4F9D-81C6-9E7D8257CA5E}.Release|x64.ActiveCfg = Release|Any CPU
+		{25218C28-5C77-4F9D-81C6-9E7D8257CA5E}.Release|x64.Build.0 = Release|Any CPU
+		{25218C28-5C77-4F9D-81C6-9E7D8257CA5E}.Release|x86.ActiveCfg = Release|Any CPU
+		{25218C28-5C77-4F9D-81C6-9E7D8257CA5E}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -147,5 +161,6 @@ Global
 		{B1767CC8-7BE8-4F98-973A-1BF2A0FB0492} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 		{A534F567-0B08-3C4A-3947-DDF553C52BC6} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
 		{5C04357D-05E2-43EB-B4D7-D8527BC3E87D} = {A534F567-0B08-3C4A-3947-DDF553C52BC6}
+		{25218C28-5C77-4F9D-81C6-9E7D8257CA5E} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 	EndGlobalSection
 EndGlobal

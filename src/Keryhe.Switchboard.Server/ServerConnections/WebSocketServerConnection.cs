@@ -34,6 +34,24 @@ public sealed class WebSocketServerConnection : IServerConnection, IAsyncDisposa
     public void IncrementLogicalCount() => Interlocked.Increment(ref _logicalCount);
     public void DecrementLogicalCount() => Interlocked.Decrement(ref _logicalCount);
 
+    /// <summary>
+    /// <paramref name="ct"/> bounds the wait for the write lock, but deliberately does NOT reach
+    /// the socket write itself — that is scoped to this connection's own lifetime instead.
+    /// </summary>
+    /// <remarks>
+    /// Cancelling a <see cref="WebSocket.SendAsync(ReadOnlyMemory{byte}, WebSocketMessageType, bool, CancellationToken)"/>
+    /// that is already in flight aborts the entire WebSocket — the protocol cannot resync after a
+    /// half-written frame, so .NET has no other option. That is catastrophic here and not merely
+    /// untidy: this socket is <b>shared</b>. Callers reach it with a single client's
+    /// <c>HttpContext.RequestAborted</c> (<c>DefaultMessageRouter.RouteClientMessageAsync</c> and
+    /// <c>ClientConnectionLifecycle</c>'s open_connection send both do), so one client
+    /// disconnecting at the wrong instant would abort the app-server connection that every other
+    /// client assigned to it depends on — a TCP reset with no close handshake, taking down message
+    /// delivery for the whole pool slot until the app server reconnects. Verified: this is exactly
+    /// what made an end-to-end test intermittently observe "connection reset by peer" right as an
+    /// unrelated client called StopAsync. Waiting for the lock is safe to cancel because nothing
+    /// has been written yet; the write is not.
+    /// </remarks>
     public async ValueTask SendAsync(ServerEnvelope envelope, CancellationToken ct)
     {
         await _writeLock.WaitAsync(ct);
@@ -41,7 +59,7 @@ public sealed class WebSocketServerConnection : IServerConnection, IAsyncDisposa
         {
             var buffer = new System.Buffers.ArrayBufferWriter<byte>();
             ServerEnvelopeSerializer.Write(buffer, envelope);
-            await _socket.SendAsync(buffer.WrittenMemory, WebSocketMessageType.Binary, endOfMessage: true, ct);
+            await _socket.SendAsync(buffer.WrittenMemory, WebSocketMessageType.Binary, endOfMessage: true, _cts.Token);
         }
         finally
         {

@@ -40,7 +40,7 @@ public enum TransportType { WebSockets, ServerSentEvents, LongPolling }
 
 > **`ConcurrentHashSet<string>` does not exist in .NET.** `ConcurrentDictionary<string, byte>` with value `0` is the standard substitute. Use `TryAdd(key, 0)` to add, `TryRemove(key, out _)` to remove, and `.Keys` to enumerate.
 
-> **`ConnectionToken` is distinct from `ConnectionId`.** `ConnectionId` is the public identity (used in `send_to_connection`, groups, management API, logs). `ConnectionToken` is an opaque, unguessable handle minted at the step-2 negotiate and presented by the client as the transport `id` query parameter; the service resolves it to the connection on the transport upgrade. Phase 1: a random value. Phase 3: encodes the owning node id so a transport request landing on any node can be routed to the owner without a registry lookup. Never expose `ConnectionToken` via the management API.
+> **`ConnectionToken` is distinct from `ConnectionId`.** `ConnectionId` is the public identity (used in `send_to_connection`, groups, management API, logs). `ConnectionToken` is an opaque, unguessable handle minted at the step-2 negotiate and presented by the client as the transport `id` query parameter; the service resolves it to the connection on the transport upgrade. Still a plain random value as of Phase 3, in both single-node and clustered deployments — the design originally sketched here (encoding the owning node id into the token itself) was superseded during Phase 3 Slice 5 by a separate lookup instead: `IConnectionTokenOwnerGrain`, keyed by the token string, tracks which node claimed it. A transport request landing on a non-owning node resolves ownership through that grain (or, for SSE/Long Polling, forwards the request there — plan decision D19) rather than parsing anything out of the token. Never expose `ConnectionToken` via the management API.
 
 ---
 
@@ -318,8 +318,8 @@ public sealed class SwitchboardOptions
 
     // --- Orleans / Clustering (Phase 3) ---
     public bool UseOrleansCluster { get; set; } = false;        // false = single-node in-memory silo
-    public string? OrleansAdoNetConnectionString { get; set; }  // SQL Server or PostgreSQL connection string
-    public string? OrleansAdoNetInvariant { get; set; }         // "System.Data.SqlClient" or "Npgsql"
+    public string? OrleansAdoNetConnectionString { get; set; }  // SQL Server, PostgreSQL, or MySQL connection string
+    public string? OrleansAdoNetInvariant { get; set; }         // "System.Data.SqlClient", "Npgsql", or "MySql.Data.MySqlClient"
     public string OrleansClusterId { get; set; } = "switchboard";
     public string OrleansServiceId { get; set; } = "switchboard";
 }

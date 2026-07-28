@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
+using System.Threading.Channels;
 using Keryhe.Switchboard.Protocol;
 using Microsoft.AspNetCore.SignalR.Protocol;
 
@@ -14,15 +16,33 @@ public sealed class AppServerDouble : IAsyncDisposable
     private readonly ClientWebSocket _socket;
     private readonly System.IO.Pipelines.Pipe _receivePipe = new();
     private readonly CancellationTokenSource _cts = new();
-    private readonly IAsyncEnumerator<ServerEnvelope> _envelopes;
+    private readonly Channel<ServerEnvelope> _envelopes =
+        Channel.CreateUnbounded<ServerEnvelope>(new UnboundedChannelOptions { SingleWriter = true });
+
+    private readonly ConcurrentQueue<ServerEnvelope> _received = new();
     private readonly Task _fillPipeTask;
+    private readonly Task _pumpTask;
+
+    private volatile string? _fillPipeEndReason;
+    private volatile Exception? _fillPipeFailure;
 
     private AppServerDouble(ClientWebSocket socket)
     {
         _socket = socket;
         _fillPipeTask = FillPipeAsync(_cts.Token);
-        _envelopes = ReadAllAsync(_cts.Token).GetAsyncEnumerator(_cts.Token);
+        _pumpTask = PumpEnvelopesAsync(_cts.Token);
     }
+
+    /// <summary>
+    /// Every envelope drained off the wire so far, in arrival order — a record, not a queue:
+    /// reading it consumes nothing, so any number of callers can look at it concurrently.
+    /// Multi-node tests need exactly this. Which app server a cluster-wide least-loaded assignment
+    /// picked (plan decision D18) is genuinely unknowable to the test in advance, so it has to be
+    /// able to inspect both doubles — and it must not do that by racing a consuming
+    /// <see cref="ReceiveAsync"/> on each and abandoning the loser. An abandoned consuming read is
+    /// not free: it stays pending and steals a later envelope out from under the next read.
+    /// </summary>
+    public IReadOnlyList<ServerEnvelope> ReceivedEnvelopes => _received.ToList();
 
     public static async Task<AppServerDouble> ConnectAsync(Uri baseAddress, string hubName, string serverToken)
     {
@@ -156,22 +176,38 @@ public sealed class AppServerDouble : IAsyncDisposable
     }
 
     /// <summary>
-    /// Pulls the next envelope from the persistent receive pipe below — unlike a one-shot
-    /// per-call socket read, this never discards bytes belonging to a second envelope that
-    /// happened to arrive in the same read as the one just consumed (exactly what back-to-back
-    /// sends of several small envelopes, e.g. AddToGroup, can produce).
+    /// Takes the next envelope the pump has drained — unlike a one-shot per-call socket read, this
+    /// never discards bytes belonging to a second envelope that happened to arrive in the same read
+    /// as the one just consumed (exactly what back-to-back sends of several small envelopes, e.g.
+    /// AddToGroup, can produce).
     /// </summary>
+    /// <remarks>
+    /// Reads from a channel the pump fills, rather than driving an <see cref="IAsyncEnumerator{T}"/>
+    /// directly. That is a correctness requirement, not a style choice: this method abandons its
+    /// read when <paramref name="timeout"/> expires, and abandoning a <c>MoveNextAsync</c> leaves
+    /// the async iterator's single state machine mid-flight, so the next call re-enters it
+    /// concurrently. That double-schedules the compiler-generated state machine box and the second
+    /// <c>MoveNext</c> on an already-completed box dereferences a field the runtime nulls out on
+    /// completion — an unhandled <see cref="NullReferenceException"/> on a thread pool thread, which
+    /// takes the whole process down. Verified: it crashed the test host outright. A channel read is
+    /// safe to abandon; the item is only dequeued when the read actually completes.
+    /// </remarks>
     public async Task<ServerEnvelope> ReceiveAsync(TimeSpan timeout)
     {
         using var cts = new CancellationTokenSource(timeout);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, _cts.Token);
 
-        if (!await _envelopes.MoveNextAsync().AsTask().WaitAsync(linked.Token))
+        try
         {
-            throw new InvalidOperationException("Server connection closed before an envelope arrived.");
+            return await _envelopes.Reader.ReadAsync(linked.Token);
         }
-
-        return _envelopes.Current;
+        catch (ChannelClosedException ex)
+        {
+            var types = string.Join(", ", _received.Select(e => e.Type));
+            throw new InvalidOperationException(
+                $"Server connection closed before an envelope arrived. Received [{types}]; socket state {_socket.State}; close status {_socket.CloseStatus?.ToString() ?? "(none)"} '{_socket.CloseStatusDescription}'; receive-loop ended by: {_fillPipeEndReason ?? "(still running)"}.",
+                ex.InnerException ?? _fillPipeFailure);
+        }
     }
 
     /// <summary>
@@ -189,6 +225,40 @@ public sealed class AppServerDouble : IAsyncDisposable
             {
                 return envelope;
             }
+        }
+    }
+
+    /// <summary>
+    /// The one and only consumer of <see cref="ReadAllAsync"/>, draining it start to finish on a
+    /// single task so the async iterator is never entered concurrently. Everything it drains goes
+    /// both into <see cref="_received"/> (the non-consuming record) and the channel
+    /// <see cref="ReceiveAsync"/> takes from.
+    /// </summary>
+    private async Task PumpEnvelopesAsync(CancellationToken ct)
+    {
+        // Completed *with* whatever killed the pump, so a waiting ReceiveAsync reports the real
+        // cause. Completing it bare would turn any pump-side failure (a malformed frame, a socket
+        // fault) into an indistinguishable "the connection closed", which is a misleading thing for
+        // a test to fail on.
+        Exception? failure = null;
+        try
+        {
+            await foreach (var envelope in ReadAllAsync(ct))
+            {
+                _received.Enqueue(envelope);
+                await _envelopes.Writer.WriteAsync(envelope, ct);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            failure = ex;
+        }
+        finally
+        {
+            _envelopes.Writer.TryComplete(failure);
         }
     }
 
@@ -226,6 +296,7 @@ public sealed class AppServerDouble : IAsyncDisposable
 
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
+                    _fillPipeEndReason = $"peer sent Close ({_socket.CloseStatus}: {_socket.CloseStatusDescription})";
                     break;
                 }
 
@@ -233,12 +304,22 @@ public sealed class AppServerDouble : IAsyncDisposable
                 var flush = await writer.FlushAsync(ct);
                 if (flush.IsCompleted)
                 {
+                    _fillPipeEndReason = "pipe reader completed";
                     break;
                 }
             }
+
+            _fillPipeEndReason ??= $"socket left Open state ({_socket.State})";
         }
         catch (Exception ex) when (ex is OperationCanceledException or WebSocketException)
         {
+            // Recorded rather than only swallowed: when this loop dies the channel completes, and
+            // every later ReceiveAsync would otherwise report a bare "connection closed" that says
+            // nothing about *why*. Kept in memory rather than logged, deliberately — the one time
+            // this mattered, the underlying fault was a race that stopped reproducing entirely once
+            // synchronous console I/O was added to the path, so the diagnostic has to cost nothing.
+            _fillPipeFailure = ex;
+            _fillPipeEndReason = $"{ex.GetType().Name}: {ex.Message}";
         }
         finally
         {
@@ -262,6 +343,7 @@ public sealed class AppServerDouble : IAsyncDisposable
         try
         {
             await _fillPipeTask;
+            await _pumpTask;
         }
         catch
         {

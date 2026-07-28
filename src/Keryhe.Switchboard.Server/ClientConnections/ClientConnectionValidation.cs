@@ -64,21 +64,24 @@ public static class ClientConnectionValidation
         return allowedOrigins.Contains(origin, StringComparer.OrdinalIgnoreCase);
     }
 
-    public readonly record struct EstablishResult(int? ErrorStatusCode, PendingConnection? Pending, ServerConnectionState? ServerConnectionState)
+    public readonly record struct EstablishResult(int? ErrorStatusCode, PendingConnection? Pending, string? ServerConnectionRef)
     {
         public bool Success => ErrorStatusCode is null;
     }
 
-    /// <summary>Validates the token, consumes the one-shot pending-connection entry, and selects
+    /// <summary>Validates the token, consumes the one-shot pending-connection entry, and assigns
     /// an app server connection — the full set of checks needed to establish a brand-new client
-    /// connection, regardless of which transport is upgrading it.</summary>
-    public static EstablishResult Establish(
+    /// connection, regardless of which transport is upgrading it. The assignment (plan decision
+    /// D18, Phase 3 Slice 4) is a <see cref="Core.ServerConnectionRef"/>-formatted string, not a
+    /// live object — it may name a connection on another node.</summary>
+    public static async Task<EstablishResult> EstablishAsync(
         HttpContext context,
         string hub,
         string connectionToken,
         ITokenService tokenService,
         IPendingConnectionStore pendingConnections,
-        IServerConnectionSelector serverConnectionSelector)
+        IServerConnectionSelector serverConnectionSelector,
+        string localNodeId)
     {
         var accessToken = ExtractAccessToken(context);
         var principal = tokenService.Validate(accessToken, SwitchboardTokenType.Client);
@@ -92,18 +95,18 @@ public static class ClientConnectionValidation
             return new EstablishResult(StatusCodes.Status403Forbidden, null, null);
         }
 
-        var pending = pendingConnections.TryConsume(connectionToken);
+        var pending = await pendingConnections.TryConsumeAsync(connectionToken, context.RequestAborted);
         if (pending is null || pending.HubName != hub)
         {
             return new EstablishResult(StatusCodes.Status401Unauthorized, null, null);
         }
 
-        var serverConnectionState = serverConnectionSelector.SelectConnection(hub);
-        if (serverConnectionState is null)
+        var serverConnectionRef = await serverConnectionSelector.AssignConnectionAsync(hub, localNodeId, context.RequestAborted);
+        if (serverConnectionRef is null)
         {
             return new EstablishResult(StatusCodes.Status503ServiceUnavailable, null, null);
         }
 
-        return new EstablishResult(null, pending, serverConnectionState);
+        return new EstablishResult(null, pending, serverConnectionRef);
     }
 }

@@ -24,7 +24,9 @@ public static class ClientConnectionEndpoint
         IConnectionRegistry connectionRegistry,
         ILocalTransportRegistry localTransportRegistry,
         ClientConnectionManager connectionManager,
+        IHubRegistry hubRegistry,
         IServerConnectionSelector serverConnectionSelector,
+        IBackplane backplane,
         IMessageRouter router,
         IOptions<SwitchboardOptions> options)
     {
@@ -35,8 +37,8 @@ public static class ClientConnectionEndpoint
         }
 
         var connectionToken = context.Request.Query["id"].ToString();
-        var result = ClientConnectionValidation.Establish(
-            context, hub, connectionToken, tokenService, pendingConnections, serverConnectionSelector);
+        var result = await ClientConnectionValidation.EstablishAsync(
+            context, hub, connectionToken, tokenService, pendingConnections, serverConnectionSelector, options.Value.NodeId);
         if (!result.Success)
         {
             context.Response.StatusCode = result.ErrorStatusCode!.Value;
@@ -44,7 +46,7 @@ public static class ClientConnectionEndpoint
         }
 
         var pending = result.Pending!;
-        var serverConnectionState = result.ServerConnectionState!;
+        var serverConnectionRef = result.ServerConnectionRef!;
 
         var socket = await context.WebSockets.AcceptWebSocketAsync();
         var ct = context.RequestAborted;
@@ -68,7 +70,8 @@ public static class ClientConnectionEndpoint
         var connection = new ClientConnection(pending.ConnectionId, connectionToken, hub, pending.UserId, transport, protocol);
 
         await ClientConnectionLifecycle.RunAsync(
-            connection, pending, enumerator, connectionRegistry, localTransportRegistry,
-            connectionManager, serverConnectionState, router, options.Value.ClientKeepAliveInterval, ct);
+            connection, pending, enumerator, TransportType.WebSockets, connectionRegistry, localTransportRegistry,
+            connectionManager, hubRegistry, serverConnectionSelector, backplane, serverConnectionRef, options.Value.NodeId,
+            router, options.Value.ClientKeepAliveInterval, ct);
     }
 }

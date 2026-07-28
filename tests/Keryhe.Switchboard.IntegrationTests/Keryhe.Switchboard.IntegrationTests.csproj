@@ -14,6 +14,17 @@
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
     <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.10" />
     <PackageReference Include="Microsoft.AspNetCore.SignalR.Protocols.MessagePack" Version="10.0.10" />
+    <!-- Only for TestSupport/PostgresContainerFixture.cs (linked below) — the Slice 7 rolling-restart
+         milestone needs genuinely separate `dotnet` processes clustering through a real database,
+         since UseLocalhostClustering's static in-memory membership table does not cross process
+         boundaries the way it does for the in-process two-silo unit tests. -->
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Reused as-is from the UnitTests project (Phase 3 Slice 6) rather than duplicated — same
+         throwaway postgres:16-alpine-via-Docker-CLI fixture, same vendored schema scripts. -->
+    <Compile Include="..\Keryhe.Switchboard.UnitTests\TestSupport\PostgresContainerFixture.cs" Link="TestSupport\PostgresContainerFixture.cs" />
   </ItemGroup>
 
   <ItemGroup>

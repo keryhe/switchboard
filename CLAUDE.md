@@ -16,7 +16,14 @@ The one bug that held up the milestone is worth knowing about, because the same 
 
 **Phase 2 (Full Transport & Protocol Support) is complete and the milestone is green.** All nine slices from [plans/phase-2-full-transport-and-protocol-support.md](plans/phase-2-full-transport-and-protocol-support.md) are implemented: SSE and Long Polling transports, MessagePack hub protocol, group/user fan-out with mixed-protocol payloads (`ServerEnvelope.Payloads`, plan decision D7), streaming/`CancelInvocation`/`Send`-`SendCore` (verified needing no new mechanism — plan decision D12), Pattern A service-direct negotiate (plan decision D11), CORS + WebSocket `Origin` enforcement, and `SampleChatApp.Angular`. 101 unit tests + 1 integration test pass. `js-redirect-check` is retargeted at the real `SampleChatApp.Api` and no longer parked for later. Full results: [docs/docs/00-review-findings.md § Phase 2 Slices 5-9](docs/docs/00-review-findings.md).
 
-The bug most worth knowing about from this phase: **`SwitchboardOptions.ClientKeepAliveInterval` was declared since Phase 1 but never actually wired to anything** — the service never sent a client a keep-alive `Ping`, so any connection idle past the real `HubConnection`'s 30s default `ServerTimeout` was silently torn down and reconnected by the client. Every automated end-to-end test in this project completes in well under a second, so this was invisible to the whole test suite and was only found by running the Angular sample in a real browser and leaving it open. Fixed in `ClientConnectionLifecycle.RunAsync` (a periodic ping loop symmetric to the server connection's own), pinned by `ClientKeepAliveEndToEndTests`. **If you add a new client-facing code path that can sit idle, make sure this ping loop is still running underneath it** — it's easy to accidentally special-case around.
+**Phase 3 (Scale-Out & Resilience) is complete and the milestone is green.** All seven slices from [plans/phase-3-scale-out-and-resilience.md](plans/phase-3-scale-out-and-resilience.md) are implemented: the fan-out inversion and `ClientConnectionState` cleanup (Slice 0), `Keryhe.Switchboard.Orleans` with grains/registry/one silo (Slice 1), the observer backplane across two silos (Slice 2), cross-node targeted/group/user sends (Slice 3), the cluster-wide server-connection pool with least-loaded assignment and `Close{allowReconnect:true}` reconnect (Slice 4, plan decision D18), node affinity with an internal forward hop for SSE/Long Polling (Slice 5, plan decision D19), vendored ADO.NET schema scripts for SQL Server/PostgreSQL/MySQL with database-provider selection moved into DI (Slice 6 — see [Sql/README.md](src/Keryhe.Switchboard.Orleans/Sql/README.md)), and `/healthz` readiness (`IReadinessProbe`, cached rather than answered with per-request grain I/O), graceful shutdown (observer unsubscribe, node deregistration), and the out-of-process two-node rolling-restart milestone test (Slice 7). `grep -ri redis` over `src/`/`tests/`/`*.csproj`/`*.sln` returns nothing but the one test asserting exactly that.
+
+Two real bugs surfaced by Slice 7's milestone test are worth knowing about, because both are silent-failure modes that no earlier slice's tests happened to exercise:
+
+1. **`AddToGroup`/`RemoveFromGroup` didn't account for cluster-wide server-connection assignment (D18).** `RoutingServerEnvelopeDispatcher` mutated *this* node's `ILocalTransportRegistry` unconditionally for both envelope types, but once an app server's assigned client can live on a different node than the app server itself, the connection named in the envelope is frequently not local. The fix mirrors `CloseConnection`'s existing pattern: `IBackplane.PublishAddToGroupAsync`/`PublishRemoveFromGroupAsync` resolve the connection's real owner node via `IConnectionGrain.GetOwnerNodeAsync()` and forward there (`IHubGrain.AddToGroupCrossNodeAsync`/`RemoveFromGroupCrossNodeAsync` → `IHubObserver.OnAddToGroup`/`OnRemoveFromGroup`). Without it, a client whose group-join landed on the wrong node silently never received a single group message — no exception, no log a happy-path test would trip over.
+2. **A node with live clients but zero local server connections for a hub never subscribed to that hub's grain at all.** `ObserverHeartbeatService` decided what to subscribe to purely from `IHubRegistry.GetAllHubs()` (server-connection-driven), so a node serving only clients — exactly D18's own "zero server connections" gate, and the ordinary few-hundred-ms window right after any node restart, before its own app-server pool reconnects — had no observer subscribed anywhere, and every cross-node message meant for its clients (including a hub method's own completion) was dropped with a logged warning and never delivered. Fixed by adding `ILocalTransportRegistry.GetKnownHubNames()` and subscribing to the union of both sources. **If you add a new place a node "knows about" a hub, make sure `ObserverHeartbeatService`'s subscription set actually includes it** — this is the second time a hub-name source got missed here (the first was `GetAllHubs()` itself, which requires a local server connection).
+
+The bug most worth knowing about from Phase 2: **`SwitchboardOptions.ClientKeepAliveInterval` was declared since Phase 1 but never actually wired to anything** — the service never sent a client a keep-alive `Ping`, so any connection idle past the real `HubConnection`'s 30s default `ServerTimeout` was silently torn down and reconnected by the client. Every automated end-to-end test in this project completes in well under a second, so this was invisible to the whole test suite and was only found by running the Angular sample in a real browser and leaving it open. Fixed in `ClientConnectionLifecycle.RunAsync` (a periodic ping loop symmetric to the server connection's own), pinned by `ClientKeepAliveEndToEndTests`. **If you add a new client-facing code path that can sit idle, make sure this ping loop is still running underneath it** — it's easy to accidentally special-case around.
 
 > **Update this file after each phase completes.** When a phase (Phase 0, Phase 1, ...) is finished, revise "Project Status" to name the new current phase, and update any other section here that the completed phase changed (solution layout once scaffolded, architecture notes if implementation diverged from the design docs, etc.).
 
@@ -45,7 +52,7 @@ Note: the milestone integration test spawns `Keryhe.Switchboard.Server.dll` and 
 
 There is no linter configured in the repo yet — do not invent one.
 
-## Architecture (Phase 2 implemented)
+## Architecture (Phase 3 implemented)
 
 ### Two-hop negotiate, then a persistent client transport
 
@@ -75,12 +82,14 @@ Both mechanisms were "designed against framework internals rather than exercised
 
 Rationale for WebSocket (not gRPC) on the server-facing side: [ADR-001](docs/docs/07-adr/ADR-001-transport-protocol.md).
 
-### Registry and backplane: single-node now, Orleans later, no Redis ever
+### Registry and backplane: single-node in-memory, or Orleans — never Redis
 
-- **Phase 1:** `InMemoryConnectionRegistry` (`ConcurrentDictionary`), `NoOpBackplane`. `IConnectionRegistry` is async-from-day-one even though the in-memory impl is synchronous, specifically so Phase 3 is a substitution, not an interface change.
-- **Phase 3:** `OrleansConnectionRegistry` delegates to grains (`IHubGrain`, `IGroupGrain`, `IUserGrain`, `IConnectionGrain`); the backplane uses **Orleans grain observers** (not Orleans Streams, not Redis Pub/Sub) — each node registers a local `HubObserverImpl` with the relevant hub grain, and broadcasts skip the origin node's observer to prevent self-echo. Local transport handles (`IClientTransport`) are *never* stored in grain state — they live in a node-local `ILocalTransportRegistry` singleton.
+Selected per node via `SwitchboardOptions.UseOrleansCluster` (`Program.cs`), both paths still fully maintained (Phase 3's own testing discipline runs the whole suite both ways):
 
-Why Orleans over Redis for both the registry and the backplane: [ADR-002](docs/docs/07-adr/ADR-002-connection-registry.md), [ADR-003](docs/docs/07-adr/ADR-003-backplane.md).
+- **In-memory (single-node deployment, `UseOrleansCluster = false`):** `InMemoryConnectionRegistry` (`ConcurrentDictionary`), `NoOpBackplane`, `LocalReadinessProbe`. `IConnectionRegistry` was async-from-day-one even in Phase 1, specifically so the Orleans path is a substitution, not an interface change.
+- **Orleans (clustered, `UseOrleansCluster = true`):** `OrleansConnectionRegistry` delegates to grains (`IHubGrain`, `IConnectionGrain`, `INodeRegistryGrain`, `IConnectionTokenOwnerGrain`); the backplane uses **Orleans grain observers** (not Orleans Streams, not Redis Pub/Sub) — each node registers a local `HubObserverImpl` with the relevant hub grain, and broadcasts/group/user sends skip the origin node's observer to prevent self-echo. `HubGrain` also holds the cluster-wide server-connection inventory and least-loaded assignment (D18, Phase 3 Slice 4). Local transport handles (`IClientTransport`) and node-local group/user/hub-name indexes (`ILocalTransportRegistry`) are *never* stored in grain state — they live in a node-local singleton, and `ObserverHeartbeatService` re-subscribes every hub name that index knows about (server-connection-driven *or* client-connection-driven — see the Slice 7 bug note above) on a short, configurable cadence, since a hub grain deactivation silently drops every subscription. `OrleansReadinessProbe` backs `/healthz` from a cached value refreshed on the same kind of cadence, not per-request grain I/O (Slice 7).
+
+Why Orleans over Redis for both the registry and the backplane: [ADR-002](docs/docs/07-adr/ADR-002-connection-registry.md), [ADR-003](docs/docs/07-adr/ADR-003-backplane.md). Clustering topology (ADO.NET providers, vendored schema, DI-based driver selection): [Sql/README.md](src/Keryhe.Switchboard.Orleans/Sql/README.md).
 
 ### Three independent token types — never reuse a signing key across them
 
@@ -96,19 +105,20 @@ An app server token must never be able to drive the management API, and vice ver
 
 `IClientTransport` (Core, transport-agnostic) → `IFramedClientTransport` (Server; adds `Framing` and `SupportsBinaryTransferFormat`) → `IPostableClientTransport` (adds `FeedAsync`, for SSE/Long Polling, whose inbound frames arrive over a separate HTTP request from whatever request is currently serving output). `ClientConnectionLifecycle` — handshake negotiation, registration, the message loop, the keep-alive ping loop, teardown — is written once against this hierarchy and reused unchanged by all three transports (`WebSocketClientTransport`, `SseClientTransport`, `LongPollingClientTransport`); only how bytes physically get in and out differs per transport. SSE is deliberately Text-only (`SupportsBinaryTransferFormat: false`) and negotiate advertises it that way — a MessagePack-over-SSE handshake is rejected explicitly rather than silently corrupting binary data. Long Polling's connection lifecycle uniquely spans many independent short-lived HTTP requests rather than one long-lived one; a background `LongPollingReaperService` closes any transport whose last poll exceeds `DisconnectTimeout`, since there's no socket-close event to notice abandonment.
 
-### Solution layout (current — Phase 2)
+### Solution layout (current — Phase 3)
 
 ```
 Switchboard.sln
 ├── src/
 │   ├── Keryhe.Switchboard.Core/        # interfaces/models, no ASP.NET dependency (Directory.Build.props enforces TreatWarningsAsErrors for src/)
 │   ├── Keryhe.Switchboard.Protocol/    # ServerEnvelope MessagePack + client-facing \x1e/length-prefix frame parsing (Framing/); also IServerConnection/IHubRegistry/ServerConnectionState (depend on ServerEnvelope, so they live here rather than Core)
-│   ├── Keryhe.Switchboard.Server/      # main service host (Kestrel, DI wiring, negotiate/client/server-connection endpoints, JWT, CLI token command); ClientConnections/ holds all three client transports + the shared lifecycle
-│   ├── Keryhe.Switchboard.Registry/    # InMemoryConnectionRegistry, InMemoryHubRegistry, PendingConnectionStore, LocalTransportRegistry, NoOpBackplane
+│   ├── Keryhe.Switchboard.Server/      # main service host (Kestrel, DI wiring, negotiate/client/server-connection endpoints, JWT, CLI token command); ClientConnections/ holds all three client transports + the shared lifecycle; references Npgsql as the reference ADO.NET driver (Phase 3 Slice 6)
+│   ├── Keryhe.Switchboard.Registry/    # InMemoryConnectionRegistry, InMemoryHubRegistry, PendingConnectionStore, LocalTransportRegistry, NoOpBackplane, LocalReadinessProbe, LocalTransportOwnershipRegistry, NullNodeAddressResolver — the single-node/in-memory half of every Orleans substitution
+│   ├── Keryhe.Switchboard.Orleans/     # Phase 3: grains (Grains/), observer backplane (Observers/), OrleansReadinessProbe, NodeRegistryPublisherService, vendored ADO.NET SQL scripts (Sql/) — no vendor-specific database dependency of its own (Slice 6)
 │   └── Keryhe.Switchboard.Connector/   # app-server-side package (replaces AddAzureSignalR()) — negotiate interception, inbound dispatch, HubLifetimeManager, connection pool
 ├── tests/
-│   ├── Keryhe.Switchboard.UnitTests/    # includes real-Kestrel-host e2e tests (TestSupport/RealKestrelServerFixture) since WebApplicationFactory's TestServer can't do real WebSockets
-│   └── Keryhe.Switchboard.IntegrationTests/  # out-of-process milestone test (ProcessFixture spawns real `dotnet` processes)
+│   ├── Keryhe.Switchboard.UnitTests/    # includes real-Kestrel-host e2e tests (TestSupport/RealKestrelServerFixture) since WebApplicationFactory's TestServer can't do real WebSockets; PostgresContainerFixture spins up a throwaway postgres:16-alpine container via the docker CLI for the ADO.NET clustering gates
+│   └── Keryhe.Switchboard.IntegrationTests/  # out-of-process tests (ProcessFixture spawns real `dotnet` processes, with graceful SIGTERM stop/restart support for Phase 3 Slice 7); links PostgresContainerFixture from UnitTests rather than duplicating it
 └── samples/
     └── SampleChatApp/
         ├── SampleChatApp.Api/          # ASP.NET Core Web API using the Connector
@@ -116,7 +126,7 @@ Switchboard.sln
         └── js-redirect-check/          # @microsoft/signalr redirect-check script, retargeted at SampleChatApp.Api (Phase 2, Slice 9)
 ```
 
-`Keryhe.Switchboard.Orleans` and `Keryhe.Switchboard.Management` are Phase 3 / Phase 4 respectively — not created yet, per the project plan's "don't scaffold empty placeholder projects" guidance. Full dependency graph and NuGet package list: [docs/docs/06-project-plan.md](docs/docs/06-project-plan.md).
+`Keryhe.Switchboard.Management` is Phase 4 — not created yet, per the project plan's "don't scaffold empty placeholder projects" guidance. Full dependency graph and NuGet package list: [docs/docs/06-project-plan.md](docs/docs/06-project-plan.md).
 
 ## Documentation Map
 

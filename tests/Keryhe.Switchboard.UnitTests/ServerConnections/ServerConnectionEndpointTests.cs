@@ -116,7 +116,7 @@ public class ServerConnectionEndpointTests : IClassFixture<ServerConnectionEndpo
         Assert.NotNull(ack.ConnectionId);
 
         var hubRegistry = _fixture.Services.GetRequiredService<IHubRegistry>();
-        Assert.True(hubRegistry.HasActiveServerConnection(hubName));
+        Assert.True(await hubRegistry.HasActiveServerConnectionAsync(hubName, CancellationToken.None));
 
         // The endpoint's ping loop (interval overridden to 200ms) should send at least one Ping.
         var ping = await ReceiveEnvelopeAsync(socket, TimeSpan.FromSeconds(5));
@@ -133,7 +133,7 @@ public class ServerConnectionEndpointTests : IClassFixture<ServerConnectionEndpo
         using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, closeCts.Token);
 
-        await WaitUntilAsync(() => !hubRegistry.HasActiveServerConnection(hubName), TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(async () => !await hubRegistry.HasActiveServerConnectionAsync(hubName, CancellationToken.None), TimeSpan.FromSeconds(5));
     }
 
     [Fact]
@@ -147,13 +147,13 @@ public class ServerConnectionEndpointTests : IClassFixture<ServerConnectionEndpo
         Assert.NotNull(response.Error);
 
         var hubRegistry = _fixture.Services.GetRequiredService<IHubRegistry>();
-        Assert.False(hubRegistry.HasActiveServerConnection(hubName));
+        Assert.False(await hubRegistry.HasActiveServerConnectionAsync(hubName, CancellationToken.None));
     }
 
-    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
+    private static async Task WaitUntilAsync(Func<Task<bool>> condition, TimeSpan timeout)
     {
         using var cts = new CancellationTokenSource(timeout);
-        while (!condition())
+        while (!await condition())
         {
             if (cts.IsCancellationRequested)
             {

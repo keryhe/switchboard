@@ -23,6 +23,7 @@
     <ProjectReference Include="..\..\src\Keryhe.Switchboard.Registry\Keryhe.Switchboard.Registry.csproj" />
     <ProjectReference Include="..\..\src\Keryhe.Switchboard.Server\Keryhe.Switchboard.Server.csproj" />
     <ProjectReference Include="..\..\src\Keryhe.Switchboard.Connector\Keryhe.Switchboard.Connector.csproj" />
+    <ProjectReference Include="..\..\src\Keryhe.Switchboard.Orleans\Keryhe.Switchboard.Orleans.csproj" />
   </ItemGroup>
 
 </Project>

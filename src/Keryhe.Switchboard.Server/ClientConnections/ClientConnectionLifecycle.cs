@@ -65,10 +65,15 @@ public static class ClientConnectionLifecycle
         ClientConnection connection,
         PendingConnection pending,
         IAsyncEnumerator<ReadOnlyMemory<byte>> frames,
+        TransportType transportType,
         IConnectionRegistry connectionRegistry,
         ILocalTransportRegistry localTransportRegistry,
         ClientConnectionManager connectionManager,
-        ServerConnectionState serverConnectionState,
+        IHubRegistry hubRegistry,
+        IServerConnectionSelector serverConnectionSelector,
+        IBackplane backplane,
+        string serverConnectionRef,
+        string localNodeId,
         IMessageRouter router,
         TimeSpan keepAliveInterval,
         CancellationToken ct)
@@ -79,20 +84,19 @@ public static class ClientConnectionLifecycle
             ConnectionToken = connection.ConnectionToken,
             HubName = connection.HubName,
             UserId = connection.UserId,
-            Transport = TransportType.WebSockets,
-            TransportHandle = connection.Transport,
-            ServerConnectionId = serverConnectionState.ConnectionId,
+            Transport = transportType,
+            ServerConnectionId = serverConnectionRef,
             ConnectedAt = DateTimeOffset.UtcNow,
         };
 
         await connectionRegistry.RegisterAsync(state, ct);
-        localTransportRegistry.Register(connection.Transport);
+        localTransportRegistry.Register(connection.Transport, connection.HubName, connection.UserId);
+        localTransportRegistry.SetHubProtocol(connection.ConnectionId, connection.HubProtocol);
         connectionManager.Register(connection);
-        serverConnectionState.IncrementLogicalCount();
 
         await connectionRegistry.SetProtocolAsync(connection.ConnectionId, connection.HubProtocol, ct);
 
-        await serverConnectionState.Connection.SendAsync(new ServerEnvelope
+        await SendToAssignedServerConnectionAsync(hubRegistry, backplane, connection.HubName, serverConnectionRef, localNodeId, new ServerEnvelope
         {
             Type = ServerEnvelopeType.OpenConnection,
             ConnectionId = connection.ConnectionId,
@@ -133,17 +137,66 @@ public static class ClientConnectionLifecycle
             {
             }
 
-            await serverConnectionState.Connection.SendAsync(new ServerEnvelope
+            // Local/registry cleanup runs before notifying the app server, not after — found by a
+            // Phase 3 Orleans e2e test racing on exactly this ordering (Phase 3 plan §Slice 1
+            // gate): with an in-memory registry, UnregisterAsync completes synchronously fast
+            // enough that the old send-then-cleanup order was never observably wrong, but a
+            // registry with real latency (a grain call) can leave the connection still resolvable
+            // via IConnectionRegistry.GetAsync for a window after close_connection was already
+            // sent and observed by the app server. Tearing down first removes that window
+            // entirely, and nothing depends on close_connection arriving before cleanup finishes.
+            await serverConnectionSelector.ReleaseConnectionAsync(connection.HubName, serverConnectionRef, CancellationToken.None);
+            connectionManager.Unregister(connection);
+            localTransportRegistry.Unregister(connection.ConnectionId);
+            await connectionRegistry.UnregisterAsync(connection.ConnectionId, CancellationToken.None);
+
+            await SendToAssignedServerConnectionAsync(hubRegistry, backplane, connection.HubName, serverConnectionRef, localNodeId, new ServerEnvelope
             {
                 Type = ServerEnvelopeType.CloseConnection,
                 ConnectionId = connection.ConnectionId,
             }, CancellationToken.None);
-
-            serverConnectionState.DecrementLogicalCount();
-            connectionManager.Unregister(connection);
-            localTransportRegistry.Unregister(connection.ConnectionId);
-            await connectionRegistry.UnregisterAsync(connection.ConnectionId, CancellationToken.None);
         }
+    }
+
+    /// <summary>
+    /// Delivers a service→app-server envelope (open/close — <c>client_message</c> goes through
+    /// <c>DefaultMessageRouter.RouteClientMessageAsync</c> instead, on the same hot path as every
+    /// other client-originated message) to whichever node <paramref name="serverConnectionRef"/>
+    /// names (plan decision D18, Phase 3 Slice 4). A local match writes directly to the live
+    /// <see cref="IServerConnection"/>; a remote one serializes the envelope exactly as it would go
+    /// over the wire to an app server and publishes it once via the backplane, mirroring
+    /// <c>DefaultMessageRouter.RouteToConnectionAsync</c>'s own local-hit-or-backplane shape one
+    /// level up. A missing local connection (already gone) or a malformed reference is dropped
+    /// silently — this call never blocks connect/disconnect on a race it cannot itself resolve.
+    /// </summary>
+    private static async Task SendToAssignedServerConnectionAsync(
+        IHubRegistry hubRegistry,
+        IBackplane backplane,
+        string hubName,
+        string serverConnectionRef,
+        string localNodeId,
+        ServerEnvelope envelope,
+        CancellationToken ct)
+    {
+        if (!ServerConnectionRef.TryParse(serverConnectionRef, out var ownerNodeId, out var serverConnectionId))
+        {
+            return;
+        }
+
+        if (ownerNodeId == localNodeId)
+        {
+            var serverConnection = hubRegistry.GetHub(hubName)?.ServerConnections.GetValueOrDefault(serverConnectionId)?.Connection;
+            if (serverConnection is not null)
+            {
+                await serverConnection.SendAsync(envelope, ct);
+            }
+
+            return;
+        }
+
+        var writer = new ArrayBufferWriter<byte>();
+        ServerEnvelopeSerializer.Write(writer, envelope);
+        await backplane.PublishServerEnvelopeAsync(hubName, serverConnectionRef, writer.WrittenMemory.ToArray(), ct);
     }
 
     /// <summary>

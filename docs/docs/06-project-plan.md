@@ -9,10 +9,12 @@ Switchboard.sln
 │   ├── Keryhe.Switchboard.Protocol/       # Message types, envelope serialization, frame parsing
 │   ├── Keryhe.Switchboard.Server/         # Main service host: Kestrel endpoints, DI wiring
 │   ├── Keryhe.Switchboard.Registry/       # IConnectionRegistry implementations (in-memory)
-│   ├── Keryhe.Switchboard.Orleans/        # Orleans grain interfaces + implementations (Phase 3)
+│   ├── Keryhe.Switchboard.Orleans/        # Orleans grain interfaces + implementations (Phase 3, complete)
 │   │                                  #   OrleansConnectionRegistry, OrleansObserverBackplane,
-│   │                                  #   HubGrain, GroupGrain, UserGrain, ConnectionGrain,
-│   │                                  #   HubObserverImpl (IHubObserver)
+│   │                                  #   HubGrain, ConnectionGrain, GroupGrain, UserGrain,
+│   │                                  #   NodeRegistryGrain, HubObserverImpl (IHubObserver) —
+│   │                                  #   Group/UserGrain back membership queries only; fan-out
+│   │                                  #   resolves node-locally instead (plan decision D17)
 │   ├── Keryhe.Switchboard.Management/     # Management REST API controllers
 │   └── Keryhe.Switchboard.Connector/      # Client library app servers add to connect to this service
 │                                      #   (replaces AddAzureSignalR() call)
@@ -50,7 +52,7 @@ Keryhe.Switchboard.Connector     ← Core + Protocol + Microsoft.AspNetCore.Sign
 | `MessagePack` | 2.x | Protocol |
 | `System.Threading.Channels` | .NET 10 | Service (write queues) |
 | `Microsoft.Orleans.Server` | 10.x | Orleans (silo host, grain runtime, observers — no streaming needed) |
-| `Microsoft.Orleans.Persistence.AdoNet` | 10.x | Orleans (grain state — SQL Server / PostgreSQL) |
+| `Microsoft.Orleans.Persistence.AdoNet` | 10.x | Orleans (grain state — SQL Server / PostgreSQL / MySQL) |
 | `Microsoft.Orleans.Clustering.AdoNet` | 10.x | Orleans (cluster membership table) |
 | `Microsoft.Orleans.Persistence.Memory` | 10.x | Orleans (in-memory — dev / single-node) |
 | `Microsoft.Extensions.ObjectPool` | .NET 10 | Service (buffer pooling) |
@@ -153,28 +155,33 @@ Both mechanisms confirmed with no fallback needed. 22 automated tests + a real o
 
 ---
 
-## Phase 3 — Scale-Out & Resilience
+## Phase 3 — Scale-Out & Resilience ✅ Complete (2026-07-28)
 
 **Goal:** Multiple service nodes and multiple app servers. No sticky sessions. Fault-tolerant reconnection. Orleans replaces both the distributed registry and the backplane — no Redis required.
 
 **Deliverables:**
 
-- [ ] `Keryhe.Switchboard.Orleans` project: define grain interfaces (`IHubGrain`, `IGroupGrain`, `IUserGrain`, `IConnectionGrain`) and observer interface (`IHubObserver`) with `[GenerateSerializer]` attributes
-- [ ] Grain implementations: state management, connection registration, observer fan-out (skipping `originNodeId` to prevent self-echo)
-- [ ] `HubObserverImpl`: plain class (not a grain) implementing `IHubObserver`; registered per silo; uses `ILocalTransportRegistry` to deliver to local transports
-- [ ] `ILocalTransportRegistry`: singleton in-process registry mapping `connectionId → IClientTransport` (node-local, never persisted to grains)
-- [ ] `OrleansConnectionRegistry`: implement `IConnectionRegistry` by delegating to grains via `IGrainFactory`
-- [ ] `OrleansObserverBackplane`: implement `IBackplane` using `IHubGrain` observer fan-out (no stream provider required)
-- [ ] Node ID generation: GUID per silo instance, passed as `originNodeId` in all grain broadcast calls
-- [ ] Silo co-hosting: wire Orleans silo into `IHostBuilder` alongside Kestrel; configure in-memory providers for dev, ADO.NET providers for production
-- [ ] ADO.NET schema: SQL scripts for Orleans cluster membership table and grain state tables (SQL Server + PostgreSQL variants)
-- [ ] Multiple app server connections per hub (Pool): selector chooses least-loaded connection
-- [ ] Server connection pool management: watch for disconnected servers, remove from hub grain
-- [ ] Client reconnect support: on server connection loss, send `Close{allowReconnect:true}` to affected clients
-- [ ] Load balancer integration: `/healthz` returns 200 only when silo is active and at least one server connection exists per registered hub
-- [ ] Integration tests: two service nodes (two silos), two app servers, client connected to Node A receives broadcast from app server connected to Node B
+- [x] `Keryhe.Switchboard.Orleans` project: grain interfaces (`IHubGrain`, `IConnectionGrain`, `IPendingConnectionGrain`, `INodeRegistryGrain`, `IConnectionTokenOwnerGrain`) and observer interface (`IHubObserver`) with `[GenerateSerializer]` attributes — no `IGroupGrain`/`IUserGrain` in the end: group/user membership is resolved node-locally against `ILocalTransportRegistry` by whichever node's observer receives a publish-by-name call (plan decision D17), not tracked in a dedicated grain
+- [x] Grain implementations: state management, connection registration, observer fan-out (skipping `originNodeId` to prevent self-echo)
+- [x] `HubObserverImpl`: plain class (not a grain) implementing `IHubObserver`; registered per silo; uses `ILocalTransportRegistry` to deliver to local transports
+- [x] `ILocalTransportRegistry`: singleton in-process registry mapping `connectionId → IClientTransport`, widened (Slice 0) to also carry hub/group/user membership indexes and the connection's negotiated `hubProtocol` — node-local, never persisted to grains
+- [x] `OrleansConnectionRegistry`: implement `IConnectionRegistry` by delegating to grains via `IGrainFactory`
+- [x] `OrleansObserverBackplane`: implement `IBackplane` using `IHubGrain` observer fan-out (no stream provider required)
+- [x] Node ID generation: GUID per silo instance, passed as `originNodeId` in all grain broadcast calls
+- [x] Silo co-hosting: wire Orleans silo into `IHostBuilder` alongside Kestrel; configure in-memory providers for dev, ADO.NET providers for production
+- [x] ADO.NET schema: SQL scripts for Orleans cluster membership table and grain state tables (SQL Server + PostgreSQL + MySQL variants), vendored under `Keryhe.Switchboard.Orleans/Sql/`; database provider selection is a host-owned DI concern (keyed `DbProviderFactory`), not a dependency of the Orleans project itself
+- [x] Multiple app server connections per hub (Pool): selector chooses least-loaded connection, cluster-wide (plan decision D18)
+- [x] Server connection pool management: watch for disconnected servers, remove from hub grain
+- [x] Client reconnect support: on server connection loss, send `Close{allowReconnect:true}` to affected clients
+- [x] Load balancer integration: `/healthz` returns 200 only when silo is active and at least one server connection exists per registered hub — answered from a short-lived cached value (`IReadinessProbe`), never per-request grain I/O
+- [x] Integration tests: two service nodes (two silos), two app servers, client connected to Node A receives broadcast from app server connected to Node B
+- [x] Node affinity for SSE/Long Polling (plan decision D19, not on the original roadmap list but required by "no sticky sessions" meeting Phase 2's multi-request transports): an internal forward hop to whichever node owns a connection, with a single-hop marker header
+- [x] Graceful shutdown: observers unsubscribed, node deregistered from the node registry, before the process exits
+- [x] Out-of-process two-node rolling-restart milestone test (`RollingRestartMilestoneEndToEndTests`, `ProcessFixture` extended with real SIGTERM stop/restart)
 
-**Milestone check:** Rolling restart of a service node does not drop client connections that reconnect within the reconnect window. Broadcasting works across nodes. No Redis anywhere in the stack.
+**Milestone check — passed.** A real out-of-process test kills node A with a genuine SIGTERM while a client connected through node A is live; node B and its own client are completely unaffected for the entire outage (no disconnect signal, broadcasts keep flowing); once node A is restarted, the affected client's automatic reconnect resumes group messages with no operator intervention. `grep -ri redis` over `src/`/`tests/`/every `.csproj`/the `.sln` returns nothing. Two real cross-node delivery bugs were found and fixed while building this test — see [00-review-findings.md § Phase 3 Scale-Out & Resilience Results](00-review-findings.md#phase-3-scale-out--resilience-results-2026-07-28). Full slice-by-slice results: same section.
+
+**What Phase 4 inherits:** `/healthz` today is deliberately the coarse, public, unauthenticated liveness/readiness signal this phase's risk register asked for (200/503, no topology detail) — Phase 4's own deliverable list already calls for the detailed per-hub view to live behind the authenticated management API (`GET /api/v1/health`) instead of expanding this endpoint. `IReadinessProbe`'s cached-value pattern (refresh out of band, answer requests from a plain field) is the template to reuse for any other endpoint that would otherwise need cluster-wide grain I/O per request. Every Orleans-clustered code path was written to keep the in-memory/single-node path (`UseOrleansCluster = false`) fully alive and tested alongside it, not just working at the interface level — Phase 4's management API needs to account for both deployment modes existing simultaneously in the field, not assume clustering is universal.
 
 ---
 

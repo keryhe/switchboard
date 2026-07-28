@@ -14,7 +14,7 @@ public sealed class PendingConnectionReaperService(IPendingConnectionStore store
 
         while (await timer.WaitForNextTickAsync(stoppingToken))
         {
-            store.ReapExpired();
+            await store.ReapExpiredAsync(stoppingToken);
         }
     }
 }
