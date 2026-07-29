@@ -46,5 +46,5 @@ public sealed class OrleansPendingConnectionStore(IGrainFactory grainFactory, Ti
     /// for the ADO.NET providers (Phase 3 Slice 6) is a real but separate concern — a SQL-level
     /// expiry sweep, not a per-grain scan — deferred to that slice rather than guessed at here.
     /// </summary>
-    public Task ReapExpiredAsync(CancellationToken ct = default) => Task.CompletedTask;
+    public Task<int> ReapExpiredAsync(CancellationToken ct = default) => Task.FromResult(0);
 }

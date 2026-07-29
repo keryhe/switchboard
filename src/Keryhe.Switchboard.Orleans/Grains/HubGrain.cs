@@ -29,6 +29,7 @@ public sealed class HubGrainState
 public sealed class HubGrain(
     [PersistentState("hub", SwitchboardOrleansExtensions.StorageProviderName)] IPersistentState<HubGrainState> state,
     IOptions<SwitchboardOptions> options,
+    SwitchboardMetrics metrics,
     ILogger<HubGrain> logger)
     : Grain, IHubGrain
 {
@@ -290,6 +291,7 @@ public sealed class HubGrain(
         if (!_observers.TryGetValue(targetNodeId, out var entry))
         {
             logger.LogWarning("Targeted observer call: node {NodeId} for hub {HubName} has no active subscription; dropping message for {Subject}.", targetNodeId, this.GetPrimaryKeyString(), subjectForLogging);
+            metrics.EnvelopesUnrouted.Add(1, new KeyValuePair<string, object?>("reason", "no_node_subscribed"));
             return;
         }
 
@@ -378,4 +380,10 @@ public sealed class HubGrain(
         DeactivateOnIdle();
         return Task.CompletedTask;
     }
+
+    public Task<HubGrainStats> GetStatsAsync() => Task.FromResult(new HubGrainStats
+    {
+        ClientConnectionCount = state.State.ConnectionIds.Count,
+        ServerConnectionCount = _serverConnectionCounts.Count,
+    });
 }

@@ -31,6 +31,20 @@ public sealed class SwitchboardOptions
     public string? ManagementSigningKeyFallback { get; set; }
     public string ManagementAudience { get; set; } = "switchboard-management";
 
+    /// <summary>Gates whether the <c>/api/v1</c> management routes are mapped at all (Phase 4 plan
+    /// decision D21). Defaults to <c>false</c>, matching <see cref="EnableDirectNegotiate"/>'s
+    /// opt-in posture — the routes are absent (404) rather than merely unauthenticated (401) until
+    /// an operator turns this on, and turning it on with no <see cref="ManagementSigningKey"/>
+    /// configured fails startup validation rather than mapping an admin surface nobody can reach.</summary>
+    public bool EnableManagementApi { get; set; } = false;
+
+    /// <summary>CIDR allowlist for the management API (Phase 4 plan decision D29), matched via
+    /// <see cref="PeerNetworkMatcher"/> — the same matcher <see cref="TrustedProxyNetworks"/> uses.
+    /// Empty (the default) means no network restriction beyond the management token itself; this is
+    /// defence in depth on top of the token, not a replacement for it, since the API is mapped onto
+    /// the same listener as ordinary client traffic rather than a separate one.</summary>
+    public string[] ManagementAllowedNetworks { get; set; } = [];
+
     // --- Server connections ---
     public int MinServerConnectionsPerHub { get; set; } = 5;
     public TimeSpan ServerPingInterval { get; set; } = TimeSpan.FromSeconds(15);
@@ -98,4 +112,20 @@ public sealed class SwitchboardOptions
     /// is reflected within roughly one probe interval, long enough that a load-balancer's probing
     /// cadence never turns into a grain-call storm.</summary>
     public TimeSpan HealthCheckCacheInterval { get; set; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>OTLP endpoint metrics (and, from Slice 5, traces/logs) are exported to (Phase 4
+    /// plan decisions D24/finding 3). Null (the default) means no OpenTelemetry pipeline is
+    /// constructed at all — no exporter thread, no periodic export — rather than one pointed
+    /// nowhere: a misconfigured-but-non-null endpoint was verified to fail completely silently (no
+    /// exception, no <see cref="Microsoft.Extensions.Logging.ILogger"/> warning, nothing on
+    /// stdout), so <c>Program.cs</c> logs the configured value explicitly at startup instead of
+    /// letting a typo look identical to a working exporter.</summary>
+    public string? OtlpEndpoint { get; set; }
+
+    /// <summary>Gates the per-message tracing span (Phase 4 plan decision D26). Default
+    /// <c>false</c> — a span per routed message at broadcast fan-out rates is the cardinality
+    /// equivalent of doing grain I/O in <c>/healthz</c> on every collection interval; the negotiate
+    /// and client-connect spans stay always-on regardless of this flag, since those are one per
+    /// connection rather than one per message.</summary>
+    public bool TraceMessageRouting { get; set; } = false;
 }

@@ -152,7 +152,7 @@ public class DefaultMessageRouterTests
 
         var router = new DefaultMessageRouter(
             connectionRegistry, new InMemoryHubRegistry(), localTransportRegistry, backplane, options,
-            NullLogger<DefaultMessageRouter>.Instance);
+            new SwitchboardMetrics(), new SwitchboardTracing(), NullLogger<DefaultMessageRouter>.Instance);
 
         return (router, localTransportRegistry, backplane);
     }

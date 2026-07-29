@@ -26,6 +26,7 @@ public sealed class OrleansTestSiloFixture : IAsyncLifetime
             .UseOrleans(silo => silo
                 .UseLocalhostClustering()
                 .AddMemoryGrainStorage(SwitchboardOrleansExtensions.StorageProviderName))
+            .ConfigureServices(services => services.AddSingleton<Keryhe.Switchboard.Core.SwitchboardMetrics>())
             .Build();
 
         await _host.StartAsync();

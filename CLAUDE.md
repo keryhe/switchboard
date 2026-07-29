@@ -25,6 +25,12 @@ Two real bugs surfaced by Slice 7's milestone test are worth knowing about, beca
 
 The bug most worth knowing about from Phase 2: **`SwitchboardOptions.ClientKeepAliveInterval` was declared since Phase 1 but never actually wired to anything** — the service never sent a client a keep-alive `Ping`, so any connection idle past the real `HubConnection`'s 30s default `ServerTimeout` was silently torn down and reconnected by the client. Every automated end-to-end test in this project completes in well under a second, so this was invisible to the whole test suite and was only found by running the Angular sample in a real browser and leaving it open. Fixed in `ClientConnectionLifecycle.RunAsync` (a periodic ping loop symmetric to the server connection's own), pinned by `ClientKeepAliveEndToEndTests`. **If you add a new client-facing code path that can sit idle, make sure this ping loop is still running underneath it** — it's easy to accidentally special-case around.
 
+**Phase 4 (Management & Observability) is complete and the milestone is green.** All six slices from [plans/phase-4-management-and-observability.md](plans/phase-4-management-and-observability.md) are implemented: `Keryhe.Switchboard.Management` (a route group mapped into the same `WebApplication`, not a separate host — dependency corrected to `Core + Protocol + ASP.NET Core`), auth via a third independent management token behind `ManagementAllowedNetworks` (Slice 1); `ManagementInvocationWriter`'s `JsonElement`→CLR-primitive mapping for the send endpoints (Slice 2); `IClusterInventory` for cluster-wide reads with mandatory pagination (Slice 3); `SwitchboardMetrics`/`SwitchboardTracing` — BCL-only `Meter`/`ActivitySource` in Core, exported via OTLP only when `OtlpEndpoint` is configured (Slices 4-5); and `AddOpenApi()` plus the operations guide ([docs/docs/10-operations.md](docs/docs/10-operations.md)) (Slice 6). 227 unit tests + 3 integration tests pass, including a milestone test against a real `otel/opentelemetry-collector` container and a plain `curl` broadcast using a CLI-generated token. Full results: [docs/docs/00-review-findings.md § Phase 4 Results](docs/docs/00-review-findings.md#phase-4-management--observability-results-2026-07-29).
+
+Two roadmap corrections recorded during Phase 4, not silently substituted: **`signalr.message.latency`** (client→server round-trip) turned out not to be observable from a proxy without reading `invocationId` out of a payload the service deliberately never parses — replaced by `signalr.message.inbound_duration`/`outbound_duration`, which measure the proxy's own honest contribution instead. **`signalr.envelopes.unrouted`/`pending_connections.active`**, deferred from Phase 1's D3/D4, were re-scoped rather than implemented as originally worded — the pending-connections gauge became a `created`/`consumed`/`expired` counter triple, since a live gauge would need an Orleans-mode "enumerate every outstanding grain" primitive Phase 3 deliberately never built.
+
+One bug worth knowing about, found only because the full suite was run repeatedly under parallel load rather than in isolation: **a test-only `MeterListener`/`ActivityListener` helper collected measurements into a plain `List<T>`**, which is not thread-safe against the concurrent `Counter.Add()`/`Histogram.Record()` calls real ASP.NET Core request threads make. A rare `InvalidOperationException` thrown *out of the production instrumentation call itself* (not the test's own code) silently aborted whatever ran immediately after it in that method body, intermittently hanging a test for its full timeout with no other symptom. Fixed by switching to `ConcurrentQueue<T>`. **If you write a MeterListener/ActivityListener-based test, use a concurrent collection for what the callback records** — a plain `List<T>` will pass every time you run it alone and fail unpredictably only under real parallel load.
+
 > **Update this file after each phase completes.** When a phase (Phase 0, Phase 1, ...) is finished, revise "Project Status" to name the new current phase, and update any other section here that the completed phase changed (solution layout once scaffolded, architecture notes if implementation diverged from the design docs, etc.).
 
 ## What This Project Is
@@ -52,7 +58,7 @@ Note: the milestone integration test spawns `Keryhe.Switchboard.Server.dll` and 
 
 There is no linter configured in the repo yet — do not invent one.
 
-## Architecture (Phase 3 implemented)
+## Architecture (Phase 4 implemented)
 
 ### Two-hop negotiate, then a persistent client transport
 
@@ -105,19 +111,20 @@ An app server token must never be able to drive the management API, and vice ver
 
 `IClientTransport` (Core, transport-agnostic) → `IFramedClientTransport` (Server; adds `Framing` and `SupportsBinaryTransferFormat`) → `IPostableClientTransport` (adds `FeedAsync`, for SSE/Long Polling, whose inbound frames arrive over a separate HTTP request from whatever request is currently serving output). `ClientConnectionLifecycle` — handshake negotiation, registration, the message loop, the keep-alive ping loop, teardown — is written once against this hierarchy and reused unchanged by all three transports (`WebSocketClientTransport`, `SseClientTransport`, `LongPollingClientTransport`); only how bytes physically get in and out differs per transport. SSE is deliberately Text-only (`SupportsBinaryTransferFormat: false`) and negotiate advertises it that way — a MessagePack-over-SSE handshake is rejected explicitly rather than silently corrupting binary data. Long Polling's connection lifecycle uniquely spans many independent short-lived HTTP requests rather than one long-lived one; a background `LongPollingReaperService` closes any transport whose last poll exceeds `DisconnectTimeout`, since there's no socket-close event to notice abandonment.
 
-### Solution layout (current — Phase 3)
+### Solution layout (current — Phase 4)
 
 ```
 Switchboard.sln
 ├── src/
-│   ├── Keryhe.Switchboard.Core/        # interfaces/models, no ASP.NET dependency (Directory.Build.props enforces TreatWarningsAsErrors for src/)
-│   ├── Keryhe.Switchboard.Protocol/    # ServerEnvelope MessagePack + client-facing \x1e/length-prefix frame parsing (Framing/); also IServerConnection/IHubRegistry/ServerConnectionState (depend on ServerEnvelope, so they live here rather than Core)
-│   ├── Keryhe.Switchboard.Server/      # main service host (Kestrel, DI wiring, negotiate/client/server-connection endpoints, JWT, CLI token command); ClientConnections/ holds all three client transports + the shared lifecycle; references Npgsql as the reference ADO.NET driver (Phase 3 Slice 6)
-│   ├── Keryhe.Switchboard.Registry/    # InMemoryConnectionRegistry, InMemoryHubRegistry, PendingConnectionStore, LocalTransportRegistry, NoOpBackplane, LocalReadinessProbe, LocalTransportOwnershipRegistry, NullNodeAddressResolver — the single-node/in-memory half of every Orleans substitution
-│   ├── Keryhe.Switchboard.Orleans/     # Phase 3: grains (Grains/), observer backplane (Observers/), OrleansReadinessProbe, NodeRegistryPublisherService, vendored ADO.NET SQL scripts (Sql/) — no vendor-specific database dependency of its own (Slice 6)
+│   ├── Keryhe.Switchboard.Core/        # interfaces/models, no ASP.NET dependency (Directory.Build.props enforces TreatWarningsAsErrors for src/); SwitchboardMetrics/SwitchboardTracing (Phase 4) — BCL-only Meter/ActivitySource, no OpenTelemetry reference here
+│   ├── Keryhe.Switchboard.Protocol/    # ServerEnvelope MessagePack + client-facing \x1e/length-prefix frame parsing (Framing/); also IServerConnection/IHubRegistry/ServerConnectionState (depend on ServerEnvelope, so they live here rather than Core); ManagementInvocationWriter (Phase 4) — the second, narrowly-chartered payload-producing type beside ClientFrameWriter
+│   ├── Keryhe.Switchboard.Server/      # main service host (Kestrel, DI wiring, negotiate/client/server-connection endpoints, JWT, CLI token command); ClientConnections/ holds all three client transports + the shared lifecycle; references Npgsql as the reference ADO.NET driver (Phase 3 Slice 6); wires OTLP export for metrics/traces/logs, gated on OtlpEndpoint (Phase 4)
+│   ├── Keryhe.Switchboard.Registry/    # InMemoryConnectionRegistry, InMemoryHubRegistry, PendingConnectionStore, LocalTransportRegistry, NoOpBackplane, LocalReadinessProbe, LocalTransportOwnershipRegistry, NullNodeAddressResolver, LocalClusterInventory (Phase 4) — the single-node/in-memory half of every Orleans substitution
+│   ├── Keryhe.Switchboard.Orleans/     # Phase 3: grains (Grains/), observer backplane (Observers/), OrleansReadinessProbe, NodeRegistryPublisherService, vendored ADO.NET SQL scripts (Sql/) — no vendor-specific database dependency of its own (Slice 6); OrleansClusterInventory + IHubGrain.GetStatsAsync + the cluster-wide hub/node directory on INodeRegistryGrain (Phase 4)
+│   ├── Keryhe.Switchboard.Management/  # Phase 4: /api/v1 route group mapped into the Server's own WebApplication (not a separate host) — group/send/connections/health endpoints, ManagementAuthFilter, AddOpenApi()/MapOpenApi(); depends on Core + Protocol, never Orleans (IClusterInventory keeps cluster reads substitutable)
 │   └── Keryhe.Switchboard.Connector/   # app-server-side package (replaces AddAzureSignalR()) — negotiate interception, inbound dispatch, HubLifetimeManager, connection pool
 ├── tests/
-│   ├── Keryhe.Switchboard.UnitTests/    # includes real-Kestrel-host e2e tests (TestSupport/RealKestrelServerFixture) since WebApplicationFactory's TestServer can't do real WebSockets; PostgresContainerFixture spins up a throwaway postgres:16-alpine container via the docker CLI for the ADO.NET clustering gates
+│   ├── Keryhe.Switchboard.UnitTests/    # includes real-Kestrel-host e2e tests (TestSupport/RealKestrelServerFixture) since WebApplicationFactory's TestServer can't do real WebSockets; PostgresContainerFixture and OtlpCollectorContainerFixture (Phase 4) each spin up a throwaway container via the docker CLI for the ADO.NET clustering gates and the OTLP-collector milestone respectively
 │   └── Keryhe.Switchboard.IntegrationTests/  # out-of-process tests (ProcessFixture spawns real `dotnet` processes, with graceful SIGTERM stop/restart support for Phase 3 Slice 7); links PostgresContainerFixture from UnitTests rather than duplicating it
 └── samples/
     └── SampleChatApp/
@@ -126,7 +133,7 @@ Switchboard.sln
         └── js-redirect-check/          # @microsoft/signalr redirect-check script, retargeted at SampleChatApp.Api (Phase 2, Slice 9)
 ```
 
-`Keryhe.Switchboard.Management` is Phase 4 — not created yet, per the project plan's "don't scaffold empty placeholder projects" guidance. Full dependency graph and NuGet package list: [docs/docs/06-project-plan.md](docs/docs/06-project-plan.md).
+Full dependency graph and NuGet package list: [docs/docs/06-project-plan.md](docs/docs/06-project-plan.md). Management API and observability design detail: [docs/docs/04-design.md §12-13](docs/docs/04-design.md#12-management-api-phase-4). Operations guide (token rotation, secret storage, metrics reference): [docs/docs/10-operations.md](docs/docs/10-operations.md).
 
 ## Documentation Map
 

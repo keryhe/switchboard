@@ -117,6 +117,7 @@ public static class SwitchboardOrleansExtensions
         builder.Services.AddSingleton<Protocol.IServerConnectionSelector, OrleansServerConnectionSelector>();
         builder.Services.AddSingleton<Core.ITransportOwnershipRegistry, OrleansTransportOwnershipRegistry>();
         builder.Services.AddSingleton<Core.INodeAddressResolver, OrleansNodeAddressResolver>();
+        builder.Services.AddSingleton<Core.IClusterInventory, OrleansClusterInventory>();
         builder.Services.AddHostedService<ObserverHeartbeatService>();
         builder.Services.AddHostedService<NodeRegistryPublisherService>();
 

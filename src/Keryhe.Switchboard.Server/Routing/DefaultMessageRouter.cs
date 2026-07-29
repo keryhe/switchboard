@@ -21,6 +21,8 @@ public sealed class DefaultMessageRouter(
     ILocalTransportRegistry localTransportRegistry,
     IBackplane backplane,
     IOptions<SwitchboardOptions> options,
+    SwitchboardMetrics metrics,
+    SwitchboardTracing tracing,
     ILogger<DefaultMessageRouter> logger) : IMessageRouter
 {
     private static readonly string[] NoExclusions = [];
@@ -33,13 +35,17 @@ public sealed class DefaultMessageRouter(
     private static readonly int MaxDegreeOfParallelism = Math.Min(8, Environment.ProcessorCount);
 
     private readonly string _nodeId = options.Value.NodeId;
+    private readonly bool _traceMessageRouting = options.Value.TraceMessageRouting;
 
     public async ValueTask RouteClientMessageAsync(string connectionId, ReadOnlyMemory<byte> payload, string hubProtocol, CancellationToken ct)
     {
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
         var state = await connectionRegistry.GetAsync(connectionId, ct);
         if (state is null)
         {
             logger.LogWarning("RouteClientMessageAsync: unknown connection {ConnectionId}.", connectionId);
+            metrics.EnvelopesUnrouted.Add(1, new KeyValuePair<string, object?>("reason", "unknown_connection"));
             return;
         }
 
@@ -49,8 +55,17 @@ public sealed class DefaultMessageRouter(
         if (!ServerConnectionRef.TryParse(state.ServerConnectionId, out var ownerNodeId, out var serverConnectionId))
         {
             logger.LogWarning("RouteClientMessageAsync: malformed server connection reference {ServerConnectionId} for {ConnectionId}.", state.ServerConnectionId, connectionId);
+            metrics.EnvelopesUnrouted.Add(1, new KeyValuePair<string, object?>("reason", "malformed_server_connection_ref"));
             return;
         }
+
+        // Gated by SwitchboardOptions.TraceMessageRouting (plan decision D26, default off) — a span
+        // per routed message at broadcast fan-out rates is the cardinality equivalent of doing
+        // grain I/O in /healthz on every collection interval, so this is opt-in, unlike the
+        // negotiate/client-connect spans.
+        using var messageRouteActivity = _traceMessageRouting
+            ? tracing.StartMessageRouteActivity(state.HubName, connectionId, _nodeId)
+            : null;
 
         var envelope = new ServerEnvelope
         {
@@ -60,22 +75,36 @@ public sealed class DefaultMessageRouter(
             Payload = payload.ToArray(),
         };
 
-        if (ownerNodeId == _nodeId)
+        var crossNode = ownerNodeId != _nodeId;
+
+        if (!crossNode)
         {
             var serverConnection = hubRegistry.GetHub(state.HubName)?.ServerConnections.GetValueOrDefault(serverConnectionId)?.Connection;
             if (serverConnection is null)
             {
                 logger.LogWarning("RouteClientMessageAsync: server connection {ServerConnectionId} for {ConnectionId} is gone.", state.ServerConnectionId, connectionId);
+                metrics.EnvelopesUnrouted.Add(1, new KeyValuePair<string, object?>("reason", "server_connection_gone"));
                 return;
             }
 
             await serverConnection.SendAsync(envelope, ct);
+            RecordInboundDuration(stopwatch, state.HubName, crossNode: false);
             return;
         }
 
         var writer = new System.Buffers.ArrayBufferWriter<byte>();
         ServerEnvelopeSerializer.Write(writer, envelope);
         await backplane.PublishServerEnvelopeAsync(state.HubName, state.ServerConnectionId, writer.WrittenMemory.ToArray(), ct);
+        RecordInboundDuration(stopwatch, state.HubName, crossNode: true);
+    }
+
+    private void RecordInboundDuration(System.Diagnostics.Stopwatch stopwatch, string hubName, bool crossNode)
+    {
+        metrics.MessagesRouted.Add(1,
+            new KeyValuePair<string, object?>("direction", "inbound"),
+            new KeyValuePair<string, object?>("hub", hubName));
+        metrics.MessageInboundDuration.Record(stopwatch.Elapsed.TotalMilliseconds,
+            new KeyValuePair<string, object?>("cross_node", crossNode));
     }
 
     public async ValueTask RouteToConnectionAsync(string connectionId, ReadOnlyMemory<byte> payload, string hubProtocol, CancellationToken ct)
@@ -136,6 +165,7 @@ public sealed class DefaultMessageRouter(
         CancellationToken ct)
     {
         var batch = new List<(string ConnectionId, byte[] Payload)>(BatchSize);
+        var recipientCount = 0;
 
         foreach (var target in targets)
         {
@@ -162,10 +192,12 @@ public sealed class DefaultMessageRouter(
                 logger.LogWarning(
                     "Fan-out skipped connection {ConnectionId}: no payload for its negotiated protocol {Protocol} (plan decision D7).",
                     target.ConnectionId, targetProtocol);
+                metrics.EnvelopesUnrouted.Add(1, new KeyValuePair<string, object?>("reason", "no_payload_for_protocol"));
                 continue;
             }
 
             batch.Add((target.ConnectionId, bytes));
+            recipientCount++;
             if (batch.Count == BatchSize)
             {
                 await WriteBatchAsync(batch, ct);
@@ -178,6 +210,7 @@ public sealed class DefaultMessageRouter(
             await WriteBatchAsync(batch, ct);
         }
 
+        metrics.BroadcastFanOutSize.Record(recipientCount);
         await publishAsync(ct);
     }
 

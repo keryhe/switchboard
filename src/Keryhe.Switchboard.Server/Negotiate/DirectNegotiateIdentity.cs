@@ -2,6 +2,7 @@ using System.Net;
 using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
+using Keryhe.Switchboard.Core;
 using Keryhe.Switchboard.Core.Models;
 
 namespace Keryhe.Switchboard.Server.Negotiate;
@@ -17,27 +18,12 @@ public static class DirectNegotiateIdentity
     /// Matches the directly connected peer address (04-design.md §1 rule 4 — never
     /// <c>X-Forwarded-For</c>, which is spoofable by the very thing this check guards against,
     /// unless a separate <c>ForwardedHeadersMiddleware</c> allowlist has already normalized
-    /// <see cref="HttpContext.Connection"/> itself) against the configured CIDR ranges.
+    /// <see cref="HttpContext.Connection"/> itself) against the configured CIDR ranges. Delegates
+    /// to <see cref="PeerNetworkMatcher"/>, shared with the management API's own network allowlist
+    /// (Phase 4 plan decision D29).
     /// </summary>
-    public static bool IsTrustedPeer(IPAddress? remoteIpAddress, IReadOnlyList<string> trustedProxyNetworks)
-    {
-        if (remoteIpAddress is null)
-        {
-            return false;
-        }
-
-        var peer = remoteIpAddress.IsIPv4MappedToIPv6 ? remoteIpAddress.MapToIPv4() : remoteIpAddress;
-
-        foreach (var cidr in trustedProxyNetworks)
-        {
-            if (IPNetwork.TryParse(cidr, out var network) && network.Contains(peer))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
+    public static bool IsTrustedPeer(IPAddress? remoteIpAddress, IReadOnlyList<string> trustedProxyNetworks) =>
+        PeerNetworkMatcher.IsTrustedPeer(remoteIpAddress, trustedProxyNetworks);
 
     /// <summary>
     /// Reads the identity headers only when <paramref name="trusted"/> — otherwise they are

@@ -33,7 +33,9 @@ public static class LongPollingClientEndpoint
         IOptions<SwitchboardOptions> options,
         LongPollingConnectionTracker tracker,
         ClientConnectionForwarder forwarder,
-        ITransportOwnershipRegistry ownershipRegistry)
+        ITransportOwnershipRegistry ownershipRegistry,
+        SwitchboardMetrics metrics,
+        SwitchboardTracing tracing)
     {
         var connectionToken = context.Request.Query["id"].ToString();
 
@@ -59,7 +61,7 @@ public static class LongPollingClientEndpoint
         await HandleEstablishAsync(
             context, hub, connectionToken, tokenService, pendingConnections, connectionRegistry,
             localTransportRegistry, connectionManager, hubRegistry, serverConnectionSelector, backplane, router, options, tracker,
-            ownershipRegistry);
+            ownershipRegistry, metrics, tracing);
     }
 
     private static async Task HandlePollAsync(
@@ -121,10 +123,12 @@ public static class LongPollingClientEndpoint
         IMessageRouter router,
         IOptions<SwitchboardOptions> options,
         LongPollingConnectionTracker tracker,
-        ITransportOwnershipRegistry ownershipRegistry)
+        ITransportOwnershipRegistry ownershipRegistry,
+        SwitchboardMetrics metrics,
+        SwitchboardTracing tracing)
     {
         var result = await ClientConnectionValidation.EstablishAsync(
-            context, hub, connectionToken, tokenService, pendingConnections, serverConnectionSelector, options.Value.NodeId);
+            context, hub, connectionToken, tokenService, pendingConnections, serverConnectionSelector, options.Value.NodeId, metrics);
         if (!result.Success)
         {
             context.Response.StatusCode = result.ErrorStatusCode!.Value;
@@ -149,7 +153,7 @@ public static class LongPollingClientEndpoint
         RunConnectionLifecycle(
             transport, pending, connectionToken, hub, connectionRegistry, localTransportRegistry,
             connectionManager, tracker, hubRegistry, serverConnectionSelector, backplane, serverConnectionRef,
-            options.Value.NodeId, router, options.Value.ClientKeepAliveInterval, ownershipRegistry);
+            options.Value.NodeId, router, options.Value.ClientKeepAliveInterval, ownershipRegistry, tracing);
 
         context.Response.StatusCode = StatusCodes.Status200OK;
     }
@@ -173,7 +177,8 @@ public static class LongPollingClientEndpoint
         string localNodeId,
         IMessageRouter router,
         TimeSpan keepAliveInterval,
-        ITransportOwnershipRegistry ownershipRegistry)
+        ITransportOwnershipRegistry ownershipRegistry,
+        SwitchboardTracing tracing)
     {
         _ = Task.Run(async () =>
         {
@@ -196,7 +201,7 @@ public static class LongPollingClientEndpoint
                 await ClientConnectionLifecycle.RunAsync(
                     connection, pending, enumerator, TransportType.LongPolling, connectionRegistry, localTransportRegistry,
                     connectionManager, hubRegistry, serverConnectionSelector, backplane, serverConnectionRef, localNodeId,
-                    router, keepAliveInterval, CancellationToken.None);
+                    router, keepAliveInterval, tracing, CancellationToken.None);
             }
             finally
             {

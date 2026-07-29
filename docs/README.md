@@ -6,14 +6,15 @@ A self-hosted connection proxy and scale-out backplane for ASP.NET Core SignalR,
 
 | Document | Description |
 |---|---|
-| [00 — Open Review Findings](docs/00-review-findings.md) | Tracked open questions from documentation review, plus the dated results log for every completed phase (Phase 0 spike through Phase 3) |
+| [00 — Open Review Findings](docs/00-review-findings.md) | Tracked open questions from documentation review, plus the dated results log for every completed phase (Phase 0 spike through Phase 4) |
 | [01 — Overview](docs/01-overview.md) | Goals, problem statement, comparison to alternatives, glossary |
 | [02 — Architecture](docs/02-architecture.md) | System topology, component breakdown, data flow diagrams |
 | [03 — Protocol](docs/03-protocol.md) | Client protocol, server protocol, management REST API specification |
 | [04 — Design](docs/04-design.md) | Detailed component design, interfaces, algorithms |
 | [05 — Data Models](docs/05-data-models.md) | Core data structures and configuration models |
-| [06 — Project Plan](docs/06-project-plan.md) | Solution structure, NuGet dependencies, phased implementation roadmap (Phase 0 spike + Phases 1–5) — Phases 0–3 complete |
+| [06 — Project Plan](docs/06-project-plan.md) | Solution structure, NuGet dependencies, phased implementation roadmap (Phase 0 spike + Phases 1–5) — Phases 0–4 complete |
 | [08 — Sample App](docs/08-sample-app.md) | Angular + ASP.NET Core API sample chat app — connection flow, ChatHub, ChatService, local dev setup |
+| [10 — Operations](docs/10-operations.md) | Token generation/rotation, secret storage, management API network allowlisting, metrics reference |
 
 ### Architecture Decision Records
 

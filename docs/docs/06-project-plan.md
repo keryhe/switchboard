@@ -34,7 +34,11 @@ Keryhe.Switchboard.Core          ← no external dependencies beyond BCL
 Keryhe.Switchboard.Protocol      ← Core + System.Text.Json + MessagePack
 Keryhe.Switchboard.Registry      ← Core
 Keryhe.Switchboard.Orleans       ← Core + Microsoft.Orleans.Server
-Keryhe.Switchboard.Management    ← Core + ASP.NET Core
+Keryhe.Switchboard.Management    ← Core + Protocol + ASP.NET Core
+                                  #   (corrected from Core + ASP.NET Core during Phase 4 — the health
+                                  #   endpoint needs IHubRegistry and the send endpoints need
+                                  #   hub-protocol writing, both of which live in Protocol; see plan
+                                  #   decision D21 in plans/phase-4-management-and-observability.md)
 Keryhe.Switchboard.Server        ← Core + Protocol + Registry + Orleans + Management + ASP.NET Core
 Keryhe.Switchboard.Connector     ← Core + Protocol + Microsoft.AspNetCore.SignalR
 ```
@@ -56,9 +60,9 @@ Keryhe.Switchboard.Connector     ← Core + Protocol + Microsoft.AspNetCore.Sign
 | `Microsoft.Orleans.Clustering.AdoNet` | 10.x | Orleans (cluster membership table) |
 | `Microsoft.Orleans.Persistence.Memory` | 10.x | Orleans (in-memory — dev / single-node) |
 | `Microsoft.Extensions.ObjectPool` | .NET 10 | Service (buffer pooling) |
-| `OpenTelemetry.Extensions.Hosting` | latest | Service (Phase 4) |
-| `OpenTelemetry.Instrumentation.AspNetCore` | latest | Service (Phase 4) |
-| `OpenTelemetry.Exporter.OpenTelemetryProtocol` | latest | Service (Phase 4) — OTLP export for logs, traces, and metrics; no Prometheus scrape endpoint |
+| `OpenTelemetry.Extensions.Hosting` | 1.17.0 | Service (Phase 4) |
+| `OpenTelemetry.Instrumentation.AspNetCore` | 1.17.0 | Service (Phase 4) |
+| `OpenTelemetry.Exporter.OpenTelemetryProtocol` | 1.17.0 | Service (Phase 4) — OTLP export for logs, traces, and metrics; no Prometheus scrape endpoint. Pinned rather than "latest" — verified conflict-free against this solution's full dependency set (MessagePack, Orleans, Npgsql, `System.IdentityModel.Tokens.Jwt`) at this exact version. |
 
 ---
 
@@ -185,29 +189,31 @@ Both mechanisms confirmed with no fallback needed. 22 automated tests + a real o
 
 ---
 
-## Phase 4 — Management & Observability
+## Phase 4 — Management & Observability ✅ Complete (2026-07-29)
 
 **Goal:** Operations team can inspect service state and send messages without a SignalR client. Full observability via standard tooling.
 
+Full plan and slice-by-slice results: [plans/phase-4-management-and-observability.md](../../plans/phase-4-management-and-observability.md), [00-review-findings.md § Phase 4 Results](00-review-findings.md#phase-4-results-2026-07-29). 224 unit tests + 3 integration tests pass, plus the real-OTLP-collector milestone test.
+
 **Deliverables:**
 
-- [ ] `Keryhe.Switchboard.Management` REST API (all endpoints from [Protocol Specification](03-protocol.md) Part 3)
-- [ ] Management API auth: management access token signed with `ManagementSigningKey` (third independent secret), `role: management` claim required, `aud` = `ManagementAudience`; server access tokens explicitly rejected ([03-protocol.md Part 3](03-protocol.md#part-3-management-rest-api))
-- [ ] OpenTelemetry metrics, exported via **OTLP** (`OpenTelemetry.Exporter.OpenTelemetryProtocol`) — no Prometheus scrape endpoint; the collector/backend is external to this service, configured by whoever operates it:
-  - `signalr.client_connections.active` (gauge, by hub)
-  - `signalr.server_connections.active` (gauge, by hub)
+- [x] `Keryhe.Switchboard.Management` REST API (all endpoints from [Protocol Specification](03-protocol.md) Part 3) — dependency corrected to `Core + Protocol + ASP.NET Core` (plan decision D21, see above)
+- [x] Management API auth: management access token signed with `ManagementSigningKey` (third independent secret), `role: management` claim required, `aud` = `ManagementAudience`; server access tokens explicitly rejected with **401** rather than 403 — a wrong-type token fails at signature/audience before role is ever considered ([03-protocol.md Part 3](03-protocol.md#part-3-management-rest-api), plan decision D21)
+- [x] OpenTelemetry metrics, exported via **OTLP** (`OpenTelemetry.Exporter.OpenTelemetryProtocol` 1.17.0) — no Prometheus scrape endpoint; the collector/backend is external to this service, configured by whoever operates it:
+  - `signalr.client_connections.active` (gauge, by hub, node-local per plan decision D24)
+  - `signalr.server_connections.active` (gauge, by hub, node-local)
   - `signalr.messages.routed` (counter, by direction and hub)
   - `signalr.broadcast.fan_out_size` (histogram)
-  - `signalr.message.latency` (histogram, client→server round trip)
-  - `signalr.envelopes.unrouted` (counter, by envelope type) — the D3/D4 metrics deferred from [Phase 1](../../plans/phase-1-core-service-mvp.md) (unrouted group/user envelopes; the pending-connection gauge below)
-  - `signalr.pending_connections.active` (gauge) — deferred from Phase 1 D4
-- [ ] OpenTelemetry tracing: spans for negotiate, client connect, message route — exported via OTLP
-- [ ] Structured logging (Microsoft.Extensions.Logging): connection lifecycle events, routing errors, server connection health changes — exported via OTLP alongside traces and metrics, so all three signals land in the same backend
-- [ ] `/healthz` endpoint: public, unauthenticated liveness/readiness (200/503, no topology detail); detailed per-hub connection status behind the authenticated management API (`GET /api/v1/health`)
-- [ ] Admin UI docs (optional): Swagger/OpenAPI spec for management API
-- [ ] Operations guide: the three token types and their independent signing keys, generation via the CLI, rotation procedure using the `…Fallback` keys, and secret storage guidance ([ADR-004](07-adr/ADR-004-token-authority.md))
+  - `signalr.message.inbound_duration` / `signalr.message.outbound_duration` (histograms, by `cross_node`) — **replaces** the originally-planned `signalr.message.latency` (client→server round trip), which turned out not to be observable from a proxy without reading `invocationId` out of the payload; see plan decision D25
+  - `signalr.envelopes.unrouted` (counter, by `reason`: `unknown_connection`, `malformed_server_connection_ref`, `server_connection_gone`, `no_payload_for_protocol`, `no_node_subscribed`) — **re-scoped** from the Phase 1 D3/D4 deferral to the drops that are real today; see plan decision D28
+  - `signalr.pending_connections.created` / `.consumed` / `.expired` (counters) — **replaces** the originally-planned `signalr.pending_connections.active` gauge, which would have needed an Orleans-mode "enumerate every outstanding grain" primitive plan decision D19 deliberately never built; see plan decision D28
+- [x] OpenTelemetry tracing: spans for negotiate and client connect (always-on, one per connection); a message-route span exists but is gated behind `TraceMessageRouting` (default `false`) — a span per routed message at broadcast fan-out rates is the cardinality equivalent of doing grain I/O in `/healthz`; see plan decision D26
+- [x] Structured logging (Microsoft.Extensions.Logging): connection lifecycle events, routing errors, server connection health changes — every call site already used named-placeholder templates rather than string interpolation; exported via OTLP alongside traces and metrics, so all three signals land in the same backend
+- [x] `/healthz` endpoint: public, unauthenticated liveness/readiness (200/503, no topology detail), pinned byte-identical to its Phase 3 shape; detailed per-hub connection status behind the authenticated management API (`GET /api/v1/health`)
+- [x] Swagger/OpenAPI spec for management API — ASP.NET Core's built-in `AddOpenApi()`, no Swashbuckle dependency, document covers every `/api/v1` route
+- [x] Operations guide: the three token types and their independent signing keys, generation via the CLI, rotation procedure using the `…Fallback` keys, and secret storage guidance ([docs/docs/10-operations.md](10-operations.md), [ADR-004](07-adr/ADR-004-token-authority.md))
 
-**Milestone check:** Active connections, message throughput, and fan-out size are visible on a dashboard built against the OTLP-exported metrics, checked manually against the operator's own visualization tooling (not Grafana-specific — no dashboard-as-code deliverable here). An on-call engineer can broadcast a maintenance notice via `curl`.
+**Milestone check:** Active connections, message throughput, and fan-out size are visible on a dashboard built against the OTLP-exported metrics — verified against a real OTLP collector container receiving `client_connections.active`, `messages.routed`, and `broadcast.fan_out_size` from a running two-node cluster (finding 3 from the Phase 4 plan: a misconfigured OTLP endpoint fails completely silently, so "the exporter is configured" proves nothing on its own — the assertion is on the collector's received data). An on-call engineer broadcasts a maintenance notice via plain `curl` with a CLI-generated management token, received by a live `HubConnection`.
 
 ---
 

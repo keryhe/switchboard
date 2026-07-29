@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Phase 4 Slice 6 — the management API's OpenAPI document (AddOpenApi()/MapOpenApi()). -->
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.10" />
+    <!-- Pinned directly: Microsoft.AspNetCore.OpenApi 10.0.10 transitively pulls Microsoft.OpenApi
+         2.0.0, which has a known high-severity advisory (GHSA-v5pm-xwqc-g5wc, patched at 2.7.5). -->
+    <PackageReference Include="Microsoft.OpenApi" Version="2.7.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Keryhe.Switchboard.Core\Keryhe.Switchboard.Core.csproj" />
+    <ProjectReference Include="..\Keryhe.Switchboard.Protocol\Keryhe.Switchboard.Protocol.csproj" />
+  </ItemGroup>
+
+</Project>

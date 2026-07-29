@@ -28,7 +28,9 @@ public static class ClientConnectionEndpoint
         IServerConnectionSelector serverConnectionSelector,
         IBackplane backplane,
         IMessageRouter router,
-        IOptions<SwitchboardOptions> options)
+        IOptions<SwitchboardOptions> options,
+        SwitchboardMetrics metrics,
+        SwitchboardTracing tracing)
     {
         if (!ClientConnectionValidation.IsOriginAllowed(context, options.Value.AllowedOrigins))
         {
@@ -38,7 +40,7 @@ public static class ClientConnectionEndpoint
 
         var connectionToken = context.Request.Query["id"].ToString();
         var result = await ClientConnectionValidation.EstablishAsync(
-            context, hub, connectionToken, tokenService, pendingConnections, serverConnectionSelector, options.Value.NodeId);
+            context, hub, connectionToken, tokenService, pendingConnections, serverConnectionSelector, options.Value.NodeId, metrics);
         if (!result.Success)
         {
             context.Response.StatusCode = result.ErrorStatusCode!.Value;
@@ -72,6 +74,6 @@ public static class ClientConnectionEndpoint
         await ClientConnectionLifecycle.RunAsync(
             connection, pending, enumerator, TransportType.WebSockets, connectionRegistry, localTransportRegistry,
             connectionManager, hubRegistry, serverConnectionSelector, backplane, serverConnectionRef, options.Value.NodeId,
-            router, options.Value.ClientKeepAliveInterval, ct);
+            router, options.Value.ClientKeepAliveInterval, tracing, ct);
     }
 }

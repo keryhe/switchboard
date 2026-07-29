@@ -59,6 +59,11 @@ public class GrainStateIdOrderingTests
     public void PendingConnectionGrainState_IdOrdering_IsPinned() => AssertIds<PendingConnectionGrainState>(
         (nameof(PendingConnectionGrainState.Record), 0));
 
+    [Fact]
+    public void NodeRegistryState_IdOrdering_IsPinned() => AssertIds<NodeRegistryState>(
+        (nameof(NodeRegistryState.InternalUrlsByNodeId), 0),
+        (nameof(NodeRegistryState.HubNamesByNodeId), 1));
+
     private static void AssertIds<T>(params (string PropertyName, int ExpectedId)[] expected)
     {
         var properties = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance);

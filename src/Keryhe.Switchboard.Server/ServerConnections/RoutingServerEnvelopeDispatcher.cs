@@ -17,7 +17,9 @@ public sealed class RoutingServerEnvelopeDispatcher(
     ILocalTransportRegistry localTransportRegistry,
     IServerConnectionSelector serverConnectionSelector,
     IBackplane backplane,
+    IGroupMembershipService groupMembership,
     IOptions<SwitchboardOptions> options,
+    SwitchboardMetrics metrics,
     ILogger<RoutingServerEnvelopeDispatcher> logger) : IServerEnvelopeDispatcher
 {
     private readonly string _nodeId = options.Value.NodeId;
@@ -28,63 +30,43 @@ public sealed class RoutingServerEnvelopeDispatcher(
         switch (envelope.Type)
         {
             case ServerEnvelopeType.SendToConnection:
-                await router.RouteToConnectionAsync(envelope.ConnectionId!, envelope.Payload!, envelope.HubProtocol!, ct);
+                await RecordOutboundAsync(envelope.HubName, () => router.RouteToConnectionAsync(envelope.ConnectionId!, envelope.Payload!, envelope.HubProtocol!, ct));
                 break;
 
             case ServerEnvelopeType.Broadcast:
-                await router.BroadcastAsync(
+                await RecordOutboundAsync(envelope.HubName, () => router.BroadcastAsync(
                     envelope.HubName!,
                     envelope.Payload!,
                     envelope.HubProtocol!,
                     envelope.Payloads,
                     envelope.ExcludedConnectionIds?.ToHashSet(),
-                    ct);
+                    ct));
                 break;
 
             case ServerEnvelopeType.SendToGroup:
-                await router.SendToGroupAsync(
+                await RecordOutboundAsync(envelope.HubName, () => router.SendToGroupAsync(
                     envelope.HubName!,
                     envelope.GroupName!,
                     envelope.Payload!,
                     envelope.HubProtocol!,
                     envelope.Payloads,
                     envelope.ExcludedConnectionIds?.ToHashSet(),
-                    ct);
+                    ct));
                 break;
 
             case ServerEnvelopeType.SendToUser:
-                await router.SendToUserAsync(envelope.HubName!, envelope.UserId!, envelope.Payload!, envelope.HubProtocol!, envelope.Payloads, ct);
+                await RecordOutboundAsync(envelope.HubName, () => router.SendToUserAsync(envelope.HubName!, envelope.UserId!, envelope.Payload!, envelope.HubProtocol!, envelope.Payloads, ct));
                 break;
 
             case ServerEnvelopeType.AddToGroup:
-                await connectionRegistry.AddToGroupAsync(envelope.ConnectionId!, envelope.GroupName!, ct);
-                if (localTransportRegistry.Get(envelope.ConnectionId!) is not null)
-                {
-                    localTransportRegistry.AddToGroup(envelope.ConnectionId!, envelope.GroupName!);
-                }
-                else
-                {
-                    // Not local — cluster-wide server-connection assignment (plan decision D18)
-                    // means the app server that sent this AddToGroup may not share a node with the
-                    // connection it names. Group membership is node-local state
-                    // (ILocalTransportRegistry, plan decision D14), so whichever node actually has
-                    // this connection must be the one whose index gets mutated (Phase 3 Slice 7 fix).
-                    await backplane.PublishAddToGroupAsync(envelope.ConnectionId!, envelope.GroupName!, _nodeId, ct);
-                }
-
+                // Delegates to IGroupMembershipService (Phase 4 plan decision D23) so the
+                // management API's group endpoints share this exact code path rather than
+                // reimplementing the cross-node forward the Phase 3 Slice 7 fix depends on.
+                await groupMembership.AddToGroupAsync(envelope.ConnectionId!, envelope.GroupName!, ct);
                 break;
 
             case ServerEnvelopeType.RemoveFromGroup:
-                await connectionRegistry.RemoveFromGroupAsync(envelope.ConnectionId!, envelope.GroupName!, ct);
-                if (localTransportRegistry.Get(envelope.ConnectionId!) is not null)
-                {
-                    localTransportRegistry.RemoveFromGroup(envelope.ConnectionId!, envelope.GroupName!);
-                }
-                else
-                {
-                    await backplane.PublishRemoveFromGroupAsync(envelope.ConnectionId!, envelope.GroupName!, _nodeId, ct);
-                }
-
+                await groupMembership.RemoveFromGroupAsync(envelope.ConnectionId!, envelope.GroupName!, ct);
                 break;
 
             case ServerEnvelopeType.CloseConnection:
@@ -125,5 +107,19 @@ public sealed class RoutingServerEnvelopeDispatcher(
 
         await connectionRegistry.UnregisterAsync(connectionId, ct);
         localTransportRegistry.Unregister(connectionId);
+    }
+
+    /// <summary>Wraps a router call with <c>signalr.messages.routed</c>{direction=outbound} and
+    /// <c>signalr.message.outbound_duration</c> (plan decision D25) — envelope received from an app
+    /// server to the router call returning, which covers both a local transport write and (for a
+    /// non-local target) the backplane publish that hands delivery to the owning node.</summary>
+    private async ValueTask RecordOutboundAsync(string? hubName, Func<ValueTask> routeAsync)
+    {
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        await routeAsync();
+        metrics.MessagesRouted.Add(1,
+            new KeyValuePair<string, object?>("direction", "outbound"),
+            new KeyValuePair<string, object?>("hub", hubName ?? "unknown"));
+        metrics.MessageOutboundDuration.Record(stopwatch.Elapsed.TotalMilliseconds);
     }
 }

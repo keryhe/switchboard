@@ -6,11 +6,22 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.0" />
+    <!-- Microsoft.AspNetCore.Authentication.JwtBearer deliberately not referenced (Phase 4 finding
+         7, plan decision D21): every authenticated endpoint here — negotiate, server connections,
+         and now the management API — validates by hand through ITokenService, matching ADR-004's
+         three-independent-token model. An unused auth-middleware package next to hand-rolled auth
+         reads as if middleware were in play when it never is. -->
     <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.2.1" />
     <!-- The reference ADO.NET driver this host ships configured out of the box (Phase 3 Slice 6) —
          see Keryhe.Switchboard.Orleans/Sql/README.md for how to swap in SQL Server/MySQL instead. -->
     <PackageReference Include="Npgsql" Version="10.0.3" />
+    <!-- Phase 4 Slice 4 (plan decision D24, finding 2 — verified conflict-free at 1.17.0 against
+         this solution's full dependency set). Only Keryhe.Switchboard.Server references
+         OpenTelemetry at all; Keryhe.Switchboard.Core's SwitchboardMetrics is BCL-only Meter/
+         Counter/Histogram, exported here only when SwitchboardOptions.OtlpEndpoint is configured. -->
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.17.0" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.17.0" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.17.0" />
   </ItemGroup>
 
   <ItemGroup>
@@ -18,6 +29,7 @@
     <ProjectReference Include="..\Keryhe.Switchboard.Protocol\Keryhe.Switchboard.Protocol.csproj" />
     <ProjectReference Include="..\Keryhe.Switchboard.Registry\Keryhe.Switchboard.Registry.csproj" />
     <ProjectReference Include="..\Keryhe.Switchboard.Orleans\Keryhe.Switchboard.Orleans.csproj" />
+    <ProjectReference Include="..\Keryhe.Switchboard.Management\Keryhe.Switchboard.Management.csproj" />
   </ItemGroup>
 
 </Project>

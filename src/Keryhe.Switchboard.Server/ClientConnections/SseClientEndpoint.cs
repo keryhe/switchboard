@@ -29,11 +29,13 @@ public static class SseClientEndpoint
         IBackplane backplane,
         IMessageRouter router,
         IOptions<SwitchboardOptions> options,
-        ITransportOwnershipRegistry ownershipRegistry)
+        ITransportOwnershipRegistry ownershipRegistry,
+        SwitchboardMetrics metrics,
+        SwitchboardTracing tracing)
     {
         var connectionToken = context.Request.Query["id"].ToString();
         var result = await ClientConnectionValidation.EstablishAsync(
-            context, hub, connectionToken, tokenService, pendingConnections, serverConnectionSelector, options.Value.NodeId);
+            context, hub, connectionToken, tokenService, pendingConnections, serverConnectionSelector, options.Value.NodeId, metrics);
         if (!result.Success)
         {
             context.Response.StatusCode = result.ErrorStatusCode!.Value;
@@ -89,7 +91,7 @@ public static class SseClientEndpoint
             var lifecycleTask = ClientConnectionLifecycle.RunAsync(
                 connection, pending, enumerator, TransportType.ServerSentEvents, connectionRegistry, localTransportRegistry,
                 connectionManager, hubRegistry, serverConnectionSelector, backplane, serverConnectionRef, options.Value.NodeId,
-                router, options.Value.ClientKeepAliveInterval, ct);
+                router, options.Value.ClientKeepAliveInterval, tracing, ct);
 
             await WriteOutputAsync(context, transport, ct);
             await lifecycleTask;

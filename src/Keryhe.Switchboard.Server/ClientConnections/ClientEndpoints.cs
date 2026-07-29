@@ -30,13 +30,15 @@ public static class ClientEndpoints
         IOptions<SwitchboardOptions> options,
         LongPollingConnectionTracker longPollingTracker,
         ClientConnectionForwarder forwarder,
-        ITransportOwnershipRegistry ownershipRegistry)
+        ITransportOwnershipRegistry ownershipRegistry,
+        SwitchboardMetrics metrics,
+        SwitchboardTracing tracing)
     {
         if (context.WebSockets.IsWebSocketRequest)
         {
             await ClientConnectionEndpoint.HandleAsync(
                 context, hub, tokenService, pendingConnections, connectionRegistry,
-                localTransportRegistry, connectionManager, hubRegistry, serverConnectionSelector, backplane, router, options);
+                localTransportRegistry, connectionManager, hubRegistry, serverConnectionSelector, backplane, router, options, metrics, tracing);
             return;
         }
 
@@ -45,14 +47,14 @@ public static class ClientEndpoints
             await SseClientEndpoint.HandleGetAsync(
                 context, hub, tokenService, pendingConnections, connectionRegistry,
                 localTransportRegistry, connectionManager, hubRegistry, serverConnectionSelector, backplane, router, options,
-                ownershipRegistry);
+                ownershipRegistry, metrics, tracing);
             return;
         }
 
         await LongPollingClientEndpoint.HandleGetAsync(
             context, hub, tokenService, pendingConnections, connectionRegistry,
             localTransportRegistry, connectionManager, hubRegistry, serverConnectionSelector, backplane, router, options,
-            longPollingTracker, forwarder, ownershipRegistry);
+            longPollingTracker, forwarder, ownershipRegistry, metrics, tracing);
     }
 
     public static async Task HandlePostAsync(

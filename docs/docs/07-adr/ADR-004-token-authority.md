@@ -55,7 +55,7 @@ The service **self-issues short-lived JWTs** using HMAC-SHA256 with a configurab
 | App server | `ServerSigningKey` | `switchboard-server` | ~24h | [03-protocol.md §2.1](../03-protocol.md#21-app-server-connection-establishment) |
 | Management | `ManagementSigningKey` | `ManagementAudience` (`switchboard-management`) | ~24h | [03-protocol.md Part 3](../03-protocol.md#part-3-management-rest-api) |
 
-  No key may be reused across rows — in particular, an app server token must never be able to drive the management API. Each supports a `…Fallback` key for zero-downtime rotation. A consolidated operations guide covering key generation, rotation, and storage is a Phase 4 deliverable ([06-project-plan.md](../06-project-plan.md)).
+  No key may be reused across rows — in particular, an app server token must never be able to drive the management API. Each supports a `…Fallback` key for zero-downtime rotation. The consolidated operations guide covering key generation, rotation, and storage — the Phase 4 deliverable this note originally pointed at as forthcoming — is now real: [docs/docs/10-operations.md](../10-operations.md) ([06-project-plan.md](../06-project-plan.md)).
 
 ---
 

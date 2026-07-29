@@ -81,7 +81,8 @@ public static class ClientConnectionValidation
         ITokenService tokenService,
         IPendingConnectionStore pendingConnections,
         IServerConnectionSelector serverConnectionSelector,
-        string localNodeId)
+        string localNodeId,
+        SwitchboardMetrics metrics)
     {
         var accessToken = ExtractAccessToken(context);
         var principal = tokenService.Validate(accessToken, SwitchboardTokenType.Client);
@@ -96,6 +97,14 @@ public static class ClientConnectionValidation
         }
 
         var pending = await pendingConnections.TryConsumeAsync(connectionToken, context.RequestAborted);
+        if (pending is not null)
+        {
+            // Removed from the store by TryConsumeAsync above regardless of what happens next, so
+            // this is "consumed" (plan decision D28) even if the hub-mismatch check below still
+            // rejects the request.
+            metrics.PendingConnectionsConsumed.Add(1);
+        }
+
         if (pending is null || pending.HubName != hub)
         {
             return new EstablishResult(StatusCodes.Status401Unauthorized, null, null);

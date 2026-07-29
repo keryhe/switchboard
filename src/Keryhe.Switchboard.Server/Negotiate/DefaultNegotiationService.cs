@@ -13,7 +13,9 @@ public sealed class DefaultNegotiationService(
     ITokenService tokenService,
     IHubRegistry hubRegistry,
     IPendingConnectionStore pendingConnections,
-    IOptions<SwitchboardOptions> options) : INegotiationService
+    IOptions<SwitchboardOptions> options,
+    SwitchboardMetrics metrics,
+    SwitchboardTracing tracing) : INegotiationService
 {
     private readonly SwitchboardOptions _options = options.Value;
 
@@ -38,6 +40,11 @@ public sealed class DefaultNegotiationService(
 
         var connectionId = accessToken.FindFirst("connectionId")?.Value
             ?? throw new InvalidOperationException("Client token is missing the connectionId claim.");
+
+        // Always-on (plan decision D26) — one span per connection, cheap, and the earliest point
+        // a slow or failing negotiate can be correlated by connectionId/hub/node.
+        using var negotiateActivity = tracing.StartNegotiateActivity(hubName, connectionId, _options.NodeId);
+
         var userId = accessToken.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
             ?? accessToken.FindFirst("sub")?.Value;
 
@@ -54,6 +61,7 @@ public sealed class DefaultNegotiationService(
             userId,
             claims.Count > 0 ? claims : null,
             DateTimeOffset.UtcNow.Add(_options.ClientTokenExpiry)), ct);
+        metrics.PendingConnectionsCreated.Add(1);
 
         // All three transports are implemented (plan §4 Slices 4-6). SSE is Text-only since it
         // cannot carry MessagePack's binary frames; Long Polling is plain request/response bodies

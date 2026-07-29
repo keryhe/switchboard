@@ -494,7 +494,11 @@ If the service does not support the requested version, it responds with `handsha
 
 ## Part 3: Management REST API
 
-The management API uses HTTP/JSON and is authenticated with a **management access token** — a third token type, distinct from both client and server tokens and signed with its own `ManagementSigningKey`. A server access token is **not** accepted here: app servers must not be able to drive the management API. See [ADR-004](07-adr/ADR-004-token-authority.md).
+The management API uses HTTP/JSON and is authenticated with a **management access token** — a third token type, distinct from both client and server tokens and signed with its own `ManagementSigningKey`. A server access token is **not** accepted here: app servers must not be able to drive the management API. A server access token presented at `/api/v1` gets **`401 Unauthorized`, not `403 Forbidden`** — it fails validation at the audience and signing key before role is ever considered, so it is cryptographically indistinguishable from a garbage token; synthesizing a nicer 403 would mean validating it a second time purely to produce a different status code. See [ADR-004](07-adr/ADR-004-token-authority.md).
+
+The entire `/api/v1` route group is additionally gated by `ManagementAllowedNetworks` (default empty = no restriction beyond the token) — a CIDR allowlist evaluated against the caller's remote IP, using the same matcher and IPv4-mapped-IPv6 normalization as `TrustedProxyNetworks` (§1). This is defence in depth on top of the token, not a replacement for it: the management API is mapped onto the same Kestrel listener as ordinary client traffic (Phase 4 plan decision D21) rather than a separate port, so a single leaked or long-lived token would otherwise reach an admin surface from anywhere. A request outside the allowlist gets `403 Forbidden`, checked before the token itself.
+
+If `EnableManagementApi` is `false` or `ManagementSigningKey` is not configured, every route under `/api/v1` is **not mapped at all** — a `404 Not Found`, not a `401`. This fails closed by absence rather than by an unauthenticated surface answering with the wrong status.
 
 **Base URL:** `https://switchboard.internal/api/v1`
 
@@ -546,7 +550,11 @@ Content-Type: application/json
   "arguments": ["System", "Server is restarting in 5 minutes"]
 }
 ```
-Response: `202 Accepted`
+Response: `202 Accepted`, including when the hub has no connections at all — fan-out to zero targets is not an error.
+
+**Argument encoding.** `arguments` is a plain JSON array; each element is mapped to a hub-protocol primitive (`string` / `long` / `double` / `bool` / `null` / nested array / nested object) before being encoded for whichever protocol each recipient negotiated (JSON or MessagePack) — this mapping is load-bearing: an implementation that hands `JsonElement`s straight to a MessagePack encoder without this step produces silently-empty argument maps for every MessagePack client, with no exception anywhere.
+
+**Management sends bypass app servers and hub code entirely.** This endpoint (and Send to User / Send to Group below) constructs the invocation and injects it straight into fan-out — no `IHubContext`, no hub method invocation, no app server round trip. If your hub has a method named `ReceiveMessage`, it does **not** run; the client's own handler for that method name is what receives this call, exactly as if a real hub method had invoked it. This matches Azure SignalR Service's REST API semantics.
 
 ---
 
@@ -601,8 +609,11 @@ Response: `200 OK`
 ### List Active Connections
 
 ```
-GET /api/v1/hubs/{hubName}/connections
+GET /api/v1/hubs/{hubName}/connections?limit={n}&continuationToken={token}
 ```
+
+**Mandatorily paginated** — a cluster-wide listing is, by construction, one grain call per connection, so an unbounded version of this endpoint is a self-inflicted outage on the first cluster with real production traffic. `limit` defaults to 100 and is clamped to a hard maximum of 1000; `continuationToken` is opaque (an implementation detail — do not parse it) and absent from the response once the last page has been returned.
+
 Response:
 ```json
 {
@@ -615,9 +626,12 @@ Response:
       "groups": ["room-42"]
     }
   ],
-  "totalCount": 1
+  "totalCount": 1,
+  "nextContinuationToken": null
 }
 ```
+
+`totalCount` is the hub's full cluster-wide membership count (one call), not the size of the returned page — a client paging through results should stop once `nextContinuationToken` is absent, not once it has seen `totalCount` items on any single page.
 
 ---
 
@@ -650,3 +664,5 @@ Response: `200 OK`
   "clientConnections": 1024
 }
 ```
+
+Both counts are cluster-wide in every deployment mode: in single-node/in-memory mode the node simply *is* the whole cluster, and in clustered mode a hub known only to a different node still appears here, backed by a small cluster-wide hub/node directory (`IClusterInventory`) rather than this node's own local state. Unlike `/healthz`, this endpoint may do real cluster I/O — it is an authenticated operator endpoint called at human rates, not a load-balancer probe, and must never acquire a load-balancer caller.

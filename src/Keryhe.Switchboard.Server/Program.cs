@@ -1,3 +1,12 @@
+// Extension-method namespaces only (Phase 4 Slice 4) — everything else in this file is fully
+// qualified by convention; OpenTelemetry's fluent builder API and Microsoft.Extensions.DependencyInjection's
+// GetRequiredService<T>() cannot be called that way.
+using Microsoft.Extensions.DependencyInjection;
+using OpenTelemetry.Logs;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
+
 if (args.Length > 0 && args[0] == "token")
 {
     return Keryhe.Switchboard.Server.Cli.TokenCommand.Run(args);
@@ -34,6 +43,11 @@ namespace Keryhe.Switchboard.Server
                 .Validate(o => !string.IsNullOrWhiteSpace(o.ServerSigningKey), "ServerSigningKey is required.")
                 .Validate(o => !o.EnableDirectNegotiate || o.TrustedProxyNetworks.Length > 0,
                     "TrustedProxyNetworks must be non-empty when EnableDirectNegotiate is true.")
+                // Phase 4 plan decision D21: fail fast rather than map an admin surface nobody can
+                // reach (mapping is a no-op without a key, per MapSwitchboardManagement below) —
+                // the operator turned the feature on and almost certainly meant to configure it.
+                .Validate(o => !o.EnableManagementApi || !string.IsNullOrWhiteSpace(o.ManagementSigningKey),
+                    "ManagementSigningKey is required when EnableManagementApi is true.")
                 // Phase 3 Slice 6: a real cluster boot must pick the ADO.NET path explicitly rather
                 // than silently falling back to single-node in-memory clustering — OrleansSiloPort
                 // is the documented test-only escape hatch (its own remarks), never something a
@@ -49,6 +63,8 @@ namespace Keryhe.Switchboard.Server
                 .ValidateOnStart();
 
             builder.Services.AddSingleton<Keryhe.Switchboard.Core.ITokenService, Keryhe.Switchboard.Server.Security.JwtTokenService>();
+            builder.Services.AddSingleton<Keryhe.Switchboard.Core.SwitchboardMetrics>();
+            builder.Services.AddSingleton<Keryhe.Switchboard.Core.SwitchboardTracing>();
             builder.Services.AddSingleton<Keryhe.Switchboard.Core.ILocalTransportRegistry, Keryhe.Switchboard.Registry.LocalTransportRegistry>();
             builder.Services.AddSingleton<Keryhe.Switchboard.Server.ClientConnections.ClientConnectionManager>();
             builder.Services.AddSingleton<Keryhe.Switchboard.Server.ClientConnections.LongPollingConnectionTracker>();
@@ -106,6 +122,7 @@ namespace Keryhe.Switchboard.Server
                 builder.Services.AddSingleton<Keryhe.Switchboard.Core.ITransportOwnershipRegistry, Keryhe.Switchboard.Registry.LocalTransportOwnershipRegistry>();
                 builder.Services.AddSingleton<Keryhe.Switchboard.Core.INodeAddressResolver, Keryhe.Switchboard.Registry.NullNodeAddressResolver>();
                 builder.Services.AddSingleton<Keryhe.Switchboard.Core.IReadinessProbe, Keryhe.Switchboard.Registry.LocalReadinessProbe>();
+                builder.Services.AddSingleton<Keryhe.Switchboard.Core.IClusterInventory, Keryhe.Switchboard.Registry.LocalClusterInventory>();
             }
 
             // D19 (Phase 3 Slice 5) SSE/Long Polling forward hop. LongPollTimeout's default 90s
@@ -121,6 +138,11 @@ namespace Keryhe.Switchboard.Server
             builder.Services.AddSingleton<Keryhe.Switchboard.Server.ServerConnections.IServerEnvelopeDispatcher, Keryhe.Switchboard.Server.ServerConnections.RoutingServerEnvelopeDispatcher>();
             builder.Services.AddHostedService<Keryhe.Switchboard.Server.Negotiate.PendingConnectionReaperService>();
 
+            // Registered unconditionally (Phase 4 plan decision D21) — RoutingServerEnvelopeDispatcher
+            // depends on IGroupMembershipService for the app-server-originated add_to_group/
+            // remove_from_group envelopes regardless of whether the management API itself is mapped.
+            Keryhe.Switchboard.Management.ManagementApiExtensions.AddSwitchboardManagement(builder.Services);
+
             builder.Services.AddCors(corsOptions =>
             {
                 corsOptions.AddPolicy("Switchboard", policy =>
@@ -133,7 +155,73 @@ namespace Keryhe.Switchboard.Server
                 });
             });
 
+            // Read raw configuration rather than IOptions<SwitchboardOptions>.Value for the same
+            // reason MapSwitchboardManagement does (see its remarks): this runs during service
+            // registration, before Build(), and resolving the bound options here would trigger the
+            // whole .Validate(...) chain early. Opt-in only (Phase 4 plan decision D24) — verified
+            // (finding 3) that a misconfigured OTLP endpoint fails completely silently, so no
+            // pipeline is constructed at all unless an endpoint is actually configured, and the
+            // endpoint is logged explicitly once the host starts rather than left to guesswork.
+            var otlpEndpoint = builder.Configuration["Switchboard:OtlpEndpoint"];
+            var nodeIdForTelemetry = builder.Configuration["Switchboard:NodeId"] ?? Guid.NewGuid().ToString("n");
+            if (!string.IsNullOrWhiteSpace(otlpEndpoint))
+            {
+                builder.Services.AddOpenTelemetry()
+                    .ConfigureResource(resource => resource.AddAttributes(
+                        [new KeyValuePair<string, object>("node.id", nodeIdForTelemetry)]))
+                    .WithMetrics(metrics => metrics
+                        .AddMeter(Keryhe.Switchboard.Core.SwitchboardMetrics.MeterName)
+                        .AddAspNetCoreInstrumentation()
+                        .AddOtlpExporter(otlp => otlp.Endpoint = new Uri(otlpEndpoint)))
+                    // Phase 4 Slice 5 (plan decision D26): the negotiate/client-connect/(opt-in)
+                    // message-route spans SwitchboardTracing records land in the same OTLP pipeline
+                    // as the metrics above, so all three signals reach one backend together.
+                    .WithTracing(tracing => tracing
+                        .AddSource(Keryhe.Switchboard.Core.SwitchboardTracing.ActivitySourceName)
+                        .AddAspNetCoreInstrumentation()
+                        .AddOtlpExporter(otlp => otlp.Endpoint = new Uri(otlpEndpoint)));
+
+                // Structured ILogger output (connection lifecycle, routing errors, server-connection
+                // health changes — all already named-property templates, never string
+                // interpolation) exported alongside traces/metrics rather than as a separate signal.
+                builder.Logging.AddOpenTelemetry(logging =>
+                {
+                    logging.IncludeFormattedMessage = true;
+                    logging.AddOtlpExporter(otlp => otlp.Endpoint = new Uri(otlpEndpoint));
+                });
+            }
+
             var app = builder.Build();
+
+            if (!string.IsNullOrWhiteSpace(otlpEndpoint))
+            {
+                app.Logger.LogInformation("OpenTelemetry metrics export configured: OtlpEndpoint={OtlpEndpoint}", otlpEndpoint);
+            }
+
+            // Node-local observable gauges (Phase 4 plan decision D24) — registered once, here,
+            // rather than as SwitchboardMetrics constructor dependencies: ILocalTransportRegistry
+            // lives in Core (could be injected directly) but IHubRegistry lives in Protocol, which
+            // Core cannot reference, so both gauges are wired the same way for symmetry. Each
+            // callback reads only this node's own in-memory state — no grain I/O, no distributed
+            // lookup — the same "answer from a cached/local field, never inline cluster I/O" posture
+            // /healthz has used since Phase 3.
+            {
+                var metricsForGauges = app.Services.GetRequiredService<Keryhe.Switchboard.Core.SwitchboardMetrics>();
+                var localTransportRegistryForGauges = app.Services.GetRequiredService<Keryhe.Switchboard.Core.ILocalTransportRegistry>();
+                var hubRegistryForGauges = app.Services.GetRequiredService<Keryhe.Switchboard.Protocol.IHubRegistry>();
+
+                metricsForGauges.RegisterClientConnectionsGauge(() =>
+                    localTransportRegistryForGauges.GetKnownHubNames().Select(hubName =>
+                        new System.Diagnostics.Metrics.Measurement<long>(
+                            localTransportRegistryForGauges.GetConnectionsForHub(hubName).Count(),
+                            new KeyValuePair<string, object?>("hub", hubName))));
+
+                metricsForGauges.RegisterServerConnectionsGauge(() =>
+                    hubRegistryForGauges.GetAllHubs().Select(hub =>
+                        new System.Diagnostics.Metrics.Measurement<long>(
+                            hub.ServerConnectionCount,
+                            new KeyValuePair<string, object?>("hub", hub.HubName))));
+            }
 
             // Bridges the DI-registered keyed DbProviderFactory into the process-global
             // DbProviderFactories registry Orleans' AdoNet providers actually consult — has to run
@@ -163,6 +251,10 @@ namespace Keryhe.Switchboard.Server
             app.MapGet("/{hub}", Keryhe.Switchboard.Server.ClientConnections.ClientEndpoints.HandleGetAsync);
             app.MapPost("/{hub}", Keryhe.Switchboard.Server.ClientConnections.ClientEndpoints.HandlePostAsync);
             app.MapDelete("/{hub}", Keryhe.Switchboard.Server.ClientConnections.ClientEndpoints.HandleDeleteAsync);
+
+            // No-op (routes not mapped) unless EnableManagementApi is on and ManagementSigningKey
+            // is configured — fails closed by absence, not by 401 (Phase 4 plan decision D21).
+            Keryhe.Switchboard.Management.ManagementApiExtensions.MapSwitchboardManagement(app);
 
             return app;
         }

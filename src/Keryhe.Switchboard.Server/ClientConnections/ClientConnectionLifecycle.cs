@@ -76,6 +76,7 @@ public static class ClientConnectionLifecycle
         string localNodeId,
         IMessageRouter router,
         TimeSpan keepAliveInterval,
+        SwitchboardTracing tracing,
         CancellationToken ct)
     {
         var state = new ClientConnectionState
@@ -89,21 +90,27 @@ public static class ClientConnectionLifecycle
             ConnectedAt = DateTimeOffset.UtcNow,
         };
 
-        await connectionRegistry.RegisterAsync(state, ct);
-        localTransportRegistry.Register(connection.Transport, connection.HubName, connection.UserId);
-        localTransportRegistry.SetHubProtocol(connection.ConnectionId, connection.HubProtocol);
-        connectionManager.Register(connection);
-
-        await connectionRegistry.SetProtocolAsync(connection.ConnectionId, connection.HubProtocol, ct);
-
-        await SendToAssignedServerConnectionAsync(hubRegistry, backplane, connection.HubName, serverConnectionRef, localNodeId, new ServerEnvelope
+        // Always-on (plan decision D26), scoped to just the establish steps — registration through
+        // the app server's OpenConnection acknowledgment — rather than the connection's whole
+        // (potentially hours-long) lifetime, which a "connect" span shouldn't model.
+        using (tracing.StartClientConnectActivity(connection.HubName, connection.ConnectionId, localNodeId))
         {
-            Type = ServerEnvelopeType.OpenConnection,
-            ConnectionId = connection.ConnectionId,
-            HubProtocol = connection.HubProtocol,
-            UserId = pending.UserId,
-            Claims = pending.Claims,
-        }, ct);
+            await connectionRegistry.RegisterAsync(state, ct);
+            localTransportRegistry.Register(connection.Transport, connection.HubName, connection.UserId);
+            localTransportRegistry.SetHubProtocol(connection.ConnectionId, connection.HubProtocol);
+            connectionManager.Register(connection);
+
+            await connectionRegistry.SetProtocolAsync(connection.ConnectionId, connection.HubProtocol, ct);
+
+            await SendToAssignedServerConnectionAsync(hubRegistry, backplane, connection.HubName, serverConnectionRef, localNodeId, new ServerEnvelope
+            {
+                Type = ServerEnvelopeType.OpenConnection,
+                ConnectionId = connection.ConnectionId,
+                HubProtocol = connection.HubProtocol,
+                UserId = pending.UserId,
+                Claims = pending.Claims,
+            }, ct);
+        }
 
         using var pingCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var pingLoop = RunKeepAlivePingLoopAsync(connection, keepAliveInterval, pingCts.Token);

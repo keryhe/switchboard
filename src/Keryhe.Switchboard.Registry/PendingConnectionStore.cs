@@ -27,8 +27,11 @@ public interface IPendingConnectionStore
     /// <summary>Removes and returns the entry if present and not expired; otherwise returns null (including for expired-but-not-yet-reaped entries).</summary>
     Task<PendingConnection?> TryConsumeAsync(string connectionToken, CancellationToken ct = default);
 
-    /// <summary>Evicts all expired entries. Intended to be called periodically by a background reaper.</summary>
-    Task ReapExpiredAsync(CancellationToken ct = default);
+    /// <summary>Evicts all expired entries. Intended to be called periodically by a background
+    /// reaper. Returns the number reaped, so the caller can record
+    /// <c>signalr.pending_connections.expired</c> (Phase 4 plan decision D28) without this store
+    /// needing an OpenTelemetry/metrics dependency of its own.</summary>
+    Task<int> ReapExpiredAsync(CancellationToken ct = default);
 }
 
 public sealed class InMemoryPendingConnectionStore(TimeProvider timeProvider) : IPendingConnectionStore
@@ -55,17 +58,18 @@ public sealed class InMemoryPendingConnectionStore(TimeProvider timeProvider) : 
         return Task.FromResult(pending.ExpiresAt > timeProvider.GetUtcNow() ? pending : null);
     }
 
-    public Task ReapExpiredAsync(CancellationToken ct = default)
+    public Task<int> ReapExpiredAsync(CancellationToken ct = default)
     {
         var now = timeProvider.GetUtcNow();
+        var reaped = 0;
         foreach (var (token, pending) in _pending)
         {
-            if (pending.ExpiresAt <= now)
+            if (pending.ExpiresAt <= now && _pending.TryRemove(token, out _))
             {
-                _pending.TryRemove(token, out _);
+                reaped++;
             }
         }
 
-        return Task.CompletedTask;
+        return Task.FromResult(reaped);
     }
 }

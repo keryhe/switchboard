@@ -138,6 +138,15 @@ public interface IHubGrain : IGrainWithStringKey
     [Alias("GetSubscriberCount")]
     Task<int> GetSubscriberCountAsync();
 
+    /// <summary>
+    /// Cluster-wide client/server connection counts for this hub (Phase 4 plan decision D27,
+    /// finding 6) — backs the management API's detailed health endpoint without transferring the
+    /// full connection-id list (<see cref="GetConnectionIdsAsync"/>'s existing shape) just to count
+    /// it.
+    /// </summary>
+    [Alias("GetStats")]
+    Task<HubGrainStats> GetStatsAsync();
+
     /// <summary>Test-only diagnostic hook for Phase 3 Slice 2's grain-deactivation gate (finding
     /// 5): forces this grain out of memory so the test can observe that
     /// <see cref="Observers.ObserverHeartbeatService"/>'s next heartbeat re-subscribes every node

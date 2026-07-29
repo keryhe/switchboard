@@ -40,6 +40,8 @@ public enum TransportType { WebSockets, ServerSentEvents, LongPolling }
 
 > **`ConcurrentHashSet<string>` does not exist in .NET.** `ConcurrentDictionary<string, byte>` with value `0` is the standard substitute. Use `TryAdd(key, 0)` to add, `TryRemove(key, out _)` to remove, and `.Keys` to enumerate.
 
+> **`LastSeen` is written once, at registration, and never refreshed (Phase 4 finding 8).** The per-request update that might look like it keeps this current actually lands on a different object, `ClientConnection.LastSeen` (`ClientConnectionLifecycle.cs`), not this registry/grain-held copy. The management API's connection listing (§ below) deliberately omits an "idle since" column rather than expose a field that would always equal `connectedAt` — either fix the write path or leave the field out of any future API; Phase 4 chose the latter.
+
 > **`ConnectionToken` is distinct from `ConnectionId`.** `ConnectionId` is the public identity (used in `send_to_connection`, groups, management API, logs). `ConnectionToken` is an opaque, unguessable handle minted at the step-2 negotiate and presented by the client as the transport `id` query parameter; the service resolves it to the connection on the transport upgrade. Still a plain random value as of Phase 3, in both single-node and clustered deployments — the design originally sketched here (encoding the owning node id into the token itself) was superseded during Phase 3 Slice 5 by a separate lookup instead: `IConnectionTokenOwnerGrain`, keyed by the token string, tracks which node claimed it. A transport request landing on a non-owning node resolves ownership through that grain (or, for SSE/Long Polling, forwards the request there — plan decision D19) rather than parsing anything out of the token. Never expose `ConnectionToken` via the management API.
 
 ---
@@ -322,6 +324,25 @@ public sealed class SwitchboardOptions
     public string? OrleansAdoNetInvariant { get; set; }         // "System.Data.SqlClient", "Npgsql", or "MySql.Data.MySqlClient"
     public string OrleansClusterId { get; set; } = "switchboard";
     public string OrleansServiceId { get; set; } = "switchboard";
+
+    // --- Management API (Phase 4) ---
+    // Fails closed by absence, not by 401: with this false (the default) or ManagementSigningKey
+    // unset, /api/v1/* is never mapped at all — 404, not a live unauthenticated 401 surface.
+    public bool EnableManagementApi { get; set; } = false;
+    // CIDR allowlist evaluated in front of the management token itself (defence in depth, since
+    // the API answers on the same listener as ordinary client traffic); empty = no restriction.
+    public string[] ManagementAllowedNetworks { get; set; } = [];
+
+    // --- Observability (Phase 4) ---
+    // Null (the default) means no OpenTelemetry pipeline is constructed at all — a misconfigured
+    // but non-null endpoint fails completely silently (verified: no exception, no log line), so
+    // Program.cs logs the configured value explicitly at startup rather than leaving a typo
+    // indistinguishable from a working exporter.
+    public string? OtlpEndpoint { get; set; }
+    // Gates the per-routed-message tracing span; negotiate/client-connect spans stay always-on
+    // regardless. A span per message at broadcast fan-out rates is the cardinality equivalent of
+    // doing grain I/O in /healthz on every collection interval.
+    public bool TraceMessageRouting { get; set; } = false;
 }
 ```
 
@@ -369,3 +390,55 @@ IConnectionGrain   // key: connectionId — maps connectionId to owning nodeId
 `IHubObserver` is an `IGrainObserver` (not a grain) implemented by `HubObserverImpl` — a plain class registered per silo that routes backplane messages to local transports via `ILocalTransportRegistry`.
 
 See [Design doc — Section 7](04-design.md#7-backplane-design-phase-3) for full method signatures.
+
+**Phase 4 additions (plan decision D27), all appends under the existing `[Alias]`/`[Id(n)]` rules:**
+
+```csharp
+// IHubGrain
+Task<HubGrainStats> GetStatsAsync();     // [Alias("GetStats")] — client/server connection counts
+                                          // as plain numbers, so GET /api/v1/health doesn't
+                                          // transfer every connection id just to call .Count() on it
+
+// INodeRegistryGrain
+Task RegisterAsync(string nodeId, string? internalUrl, IReadOnlyList<string> hubNames); // internalUrl now nullable
+Task<IReadOnlyList<string>> GetAllNodesAsync();     // [Alias("GetAllNodes")]
+Task<IReadOnlyList<string>> GetAllHubNamesAsync();  // [Alias("GetAllHubNames")] — the cluster-wide
+                                                     // hub directory neither IHubRegistry.GetAllHubs()
+                                                     // nor ILocalTransportRegistry.GetKnownHubNames()
+                                                     // can answer alone (finding 5)
+```
+
+```csharp
+[GenerateSerializer]
+public sealed class HubGrainStats
+{
+    [Id(0)] public int ClientConnectionCount { get; set; }
+    [Id(1)] public int ServerConnectionCount { get; set; }
+}
+```
+
+`HubGrainStats` is an RPC-only DTO, not persisted grain state — like `ServerConnectionAssignment`/`ConnectionLocation` before it, it is deliberately *not* pinned by `GrainStateIdOrderingTests` (that test only pins types Orleans actually persists to storage).
+
+`NodeRegistryState` (persisted grain state, already `[GenerateSerializer]`) gained a second field, appended under the same rule:
+
+```csharp
+[Id(0)] public Dictionary<string, string?> InternalUrlsByNodeId { get; init; } = new();
+[Id(1)] public Dictionary<string, List<string>> HubNamesByNodeId { get; init; } = new();  // new (Phase 4)
+```
+
+---
+
+## Management API DTOs (Phase 4)
+
+Defined in `Keryhe.Switchboard.Management/Models/ManagementDtos.cs`.
+
+```csharp
+public sealed record ManagementSendRequest(string Target, JsonElement[]? Arguments);
+
+public sealed record ManagementHealthResponse(
+    string Status,
+    IReadOnlyDictionary<string, int> ServerConnections,
+    int ClientConnections);
+```
+
+The connection-listing and pagination shapes (`ConnectionsPage`, `ConnectionSummary`, the `limit`/`continuationToken` query parameters) are defined in `Keryhe.Switchboard.Core.IClusterInventory` — see [03-protocol.md Part 3](03-protocol.md#list-active-connections) for the wire shape and pagination semantics. `ConnectionSummary` deliberately has no `lastSeenAt`/`idleSince` field — see the `ClientConnectionState.LastSeen` note above (finding 8).
