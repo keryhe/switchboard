@@ -194,12 +194,16 @@ the response) rather than relying on the framework to do it implicitly — the r
 transport blocks on `HttpCompletionOption.ResponseHeadersRead` and hangs indefinitely if headers
 are only logically committed but never actually written to the wire.
 
-Service streams events, one hub message's raw bytes per `data:` line:
+Service streams events, one hub message's raw bytes per `data:` line, each event terminated with
+**CRLF CRLF** (`\r\n\r\n`), not a bare `\n\n`. The .NET 10 SignalR client's SSE parser tolerates
+LF-only termination, but the .NET 8 client's does not — it throws
+`FormatException: Unexpected '\n' in message` and never completes the handshake. CRLF is what
+every SSE consumer accepts, so it is the wire format, not an optional accommodation:
 ```
-data: {"type":6}\x1e
-
-data: {"type":1,"target":"ReceiveMessage","arguments":["Bob","Hi"]}\x1e
-
+data: {"type":6}\x1e\r\n
+\r\n
+data: {"type":1,"target":"ReceiveMessage","arguments":["Bob","Hi"]}\x1e\r\n
+\r\n
 ```
 
 Client sends messages via HTTP POST:

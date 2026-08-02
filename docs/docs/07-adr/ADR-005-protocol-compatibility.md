@@ -43,6 +43,7 @@ This service could either:
 | MessagePack hub protocol | Full implementation (length-prefix framing) |
 | Hub message types 1–7 | All implemented |
 | Stateful reconnect | **Not supported** — negotiated opt-in feature; clients fall back to standard reconnect (see below) |
+| Client results (`Clients.Client(id).InvokeAsync<T>(...)`) | **Not supported** — throws a Switchboard-specific error naming the limitation (see below) |
 | Hub protocol version negotiation | v1 (v2 when needed) |
 
 ---
@@ -53,6 +54,7 @@ This service could either:
 - **Azure SignalR Service SDK server-side (`AddAzureSignalR()`).**  The connector library (`AddSwitchboardConnector()`) is not a drop-in replacement at the NuGet package level — it requires a package swap. However, the hub code and client code are unaffected.
 - **Undocumented Azure internals.** Features like shadow copy negotiation, Azure-specific tracing headers, or internal load-balancing signals are not replicated.
 - **Stateful reconnect** (`.withStatefulReconnect()` / `WithStatefulReconnect()`, .NET 8+). This buffers un-acknowledged messages and replays them on resume — a form of message replay this project treats as a [non-goal](../01-overview.md#non-goals). Because the feature is negotiated and opt-in, a client that requests it against this service simply **falls back to standard reconnect** (which fires `OnDisconnected`/`OnReconnected` and does not preserve in-flight messages); the connection is not broken. Deferred as a candidate future enhancement — see the note in [01-overview.md Non-Goals](../01-overview.md#non-goals) on why per-connection buffering is costly in a proxy/clustered topology.
+- **Client results** (`Clients.Client(id).InvokeAsync<T>(...)`, a first-class SignalR feature since .NET 8). Correctly routing the client's eventual completion back to the *originating* app server — not just any app server — needs a new correlated-completion path, since that app server and the client's assigned server connection can be different processes under the cluster-wide server-connection assignment ([04-design.md §7](../04-design.md), plan decision D18). Structurally the same shape of problem as stateful reconnect: per-invocation state that does not survive the proxy/scale-out topology unmodified. Hub code that calls it gets a Switchboard-specific `NotSupportedException` naming the limitation, not the framework's bare `NotImplementedException: <T> does not support client return values.` — see [04-design.md §14](../04-design.md#14-hublifetimemanager-coverage-phase-5). Deferred as a candidate future enhancement (Phase 5 plan decision D32), same disposition as stateful reconnect.
 
 ---
 

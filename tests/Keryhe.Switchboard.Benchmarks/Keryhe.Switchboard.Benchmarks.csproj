@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- BenchmarkDotNet-generated code and its own attribute usage patterns are not held to the
+         same bar as src/ (which has TreatWarningsAsErrors via src/Directory.Build.props — this
+         project sits under tests/, which inherits nothing from it). -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 0.15.8 verified conflict-free against this repo's dependency set (Phase 5 finding 7) —
+         BenchmarkDotNet is an in-process microbenchmark harness (tight iteration loops, statistical
+         outlier rejection); it answers "how expensive is this operation," not "what happens under
+         concurrent load" (plan decision D33 — the latter is tests/Keryhe.Switchboard.LoadHarness,
+         Slice 5). -->
+    <PackageReference Include="BenchmarkDotNet" Version="0.15.8" />
+    <!-- Forced to resolve a version conflict: Keryhe.Switchboard.Server pulls in
+         Microsoft.Orleans.Server (>= 5.0.0) while BenchmarkDotNet pulls in Microsoft.CodeAnalysis.CSharp
+         (which needs exactly 4.14.0) — both transitive, neither project depends on this package
+         directly. 5.0.0 satisfies both ranges. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.Common" Version="5.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Keryhe.Switchboard.Core\Keryhe.Switchboard.Core.csproj" />
+    <ProjectReference Include="..\..\src\Keryhe.Switchboard.Protocol\Keryhe.Switchboard.Protocol.csproj" />
+    <ProjectReference Include="..\..\src\Keryhe.Switchboard.Registry\Keryhe.Switchboard.Registry.csproj" />
+    <ProjectReference Include="..\..\src\Keryhe.Switchboard.Server\Keryhe.Switchboard.Server.csproj" />
+  </ItemGroup>
+
+</Project>

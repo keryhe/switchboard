@@ -221,21 +221,24 @@ Full plan and slice-by-slice results: [plans/phase-4-management-and-observabilit
 
 **Goal:** Validate that existing real-world apps work without modification and characterize performance limits.
 
+**Status: complete and the milestone is green.** Full results: [docs/docs/00-review-findings.md § Phase 5 Results](00-review-findings.md#phase-5-compatibility-testing--benchmarking-results-2026-08-02).
+
 **Deliverables:**
 
-- [ ] Compatibility test matrix: each official SignalR client SDK × each transport × each protocol
-  - .NET 8 client, .NET 10 client
-  - JavaScript / TypeScript client (npm `@microsoft/signalr`) — primary target, used by `SampleChatApp.Angular`
-  - Java client
-- [ ] End-to-end test of `SampleChatApp.Angular` + `SampleChatApp.Api` against the proxy: negotiate flow, group messaging, server-initiated push, reconnect
-- [ ] Verify `AddSwitchboardConnector()` is a drop-in for `AddAzureSignalR()` (same `IHubLifetimeManager` contract)
-- [ ] Benchmark suite using `BenchmarkDotNet`:
-  - Negotiate throughput (connections/sec)
-  - Message routing latency (P50, P95, P99)
-  - Broadcast fan-out throughput (messages/sec × connection count)
-  - Memory per connection
-- [ ] Load test: 10,000 simulated clients using `Microsoft.AspNetCore.SignalR.Client` in headless mode
-- [ ] Document observed limits and recommended Kestrel/OS tuning (file descriptor limits, thread pool, etc.)
+- [x] Compatibility test matrix: each official SignalR client SDK × each transport × each protocol — `tests/Keryhe.Switchboard.CompatibilityTests`, generated into [docs/docs/11-compatibility-matrix.md](11-compatibility-matrix.md) (plan decision D36) from a real run against a real out-of-process service
+  - .NET 8 client (found and fixed a real defect: the .NET 8 SSE parser rejects the service's original bare-LF event termination — finding 1), .NET 10 client (already covered by the Phase 2 transport×protocol matrix)
+  - JavaScript client, both `@microsoft/signalr` **8.0.17 and 10.0.0** (finding 9 — varying only the SDK version, not just the SDK, is what finding 1 argues for)
+  - Java client (`com.microsoft.signalr` 9.0.6) — real, Docker-gated (D34), and itself surfaced two SDK-level gaps neither assumed nor guessed: no `SERVER_SENT_EVENTS` transport, no MessagePack hub protocol class in the jar at all; a third — the SDK's `LongPollingTransport` doesn't authenticate its establishing request — was found empirically and is recorded as a known SDK limitation, not chased into the library's internals (deliberately deprioritized; this project's actual usage is .NET/JS-centric)
+- [x] Verify `AddSwitchboardConnector()` is a drop-in for `AddAzureSignalR()` (same `HubLifetimeManager<THub>` contract) — [04-design.md §14](04-design.md#14-hublifetimemanager-coverage-phase-5): all 13 abstract members implemented (reflection-pinned), the 3 virtual members accounted for explicitly. One real, previously-undocumented gap found: client results (`Clients.Client(id).InvokeAsync<T>(...)`) throw the framework's bare `NotImplementedException` with no override — plan decision D32 resolved this as a documented non-goal (beside stateful reconnect, same structural reason) plus a Switchboard-specific `NotSupportedException`, not full implementation (Phase-3-sized work, out of scope for a validation phase)
+- [x] Known incompatibilities become executable assertions (plan decision D31), not prose: `Context.GetHttpContext()` is always `null`; a custom `IUserIdProvider` silently diverges from the service's user index; `.WithStatefulReconnect()` falls back to standard reconnect gracefully — `tests/Keryhe.Switchboard.UnitTests/EndToEnd/KnownIncompatibilityTests.cs`
+- [x] Benchmark suite — **split per plan decision D33**, a roadmap correction in the same category as Phase 4's D25: BenchmarkDotNet (0.15.8) answers "how expensive is this operation" (`tests/Keryhe.Switchboard.Benchmarks`: envelope serialization, frame parsing, `HubMessageClassifier.IsPing`, fan-out at 1/100/1k/10k local targets, `ManagementInvocationWriter`); the concurrent-load questions below are a separate plain console app, since BDN's single-threaded microbenchmark loops cannot answer them (finding 7)
+  - [x] Negotiate throughput (connections/sec) — `tests/Keryhe.Switchboard.LoadHarness`
+  - [x] Message routing latency (P50, P95, P99) — read from the service's own `signalr.message.inbound_duration`/`outbound_duration` OTLP histograms (Phase 4 D25), cross-checked against the harness's independent end-to-end timings, not re-derived
+  - [x] Broadcast fan-out throughput (messages/sec × connection count) — both the microbenchmark (routing cost in isolation) and the load harness (real sockets, real delivery)
+  - [x] Memory per connection — a real RSS-delta measurement of the spawned service process, not an estimate
+- [x] Load test: 10,000 simulated clients — real run recorded in [docs/docs/12-performance.md](12-performance.md): reached 3,336 before a host file-descriptor limit stopped the ramp, classified and reported precisely (plan decision D35), not mistaken for a service defect
+- [x] Document observed limits and recommended Kestrel/OS tuning — [docs/docs/12-performance.md](12-performance.md), generated from that same real run, not general advice
+- [~] End-to-end test of `SampleChatApp.Angular` + `SampleChatApp.Api` against the proxy — **covered by the JS compatibility probe** (`tests/clients/js`), which is the Angular sample's own client stack (`@microsoft/signalr`) exercised headlessly against the real service, rather than by a separate browser-driven Angular test; `js-redirect-check` (a manual script nothing ran automatically) was retired in favor of this, since its negotiate-redirect check was a strict subset of the probe scenario
 
 ---
 

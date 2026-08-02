@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- A plain console app (plan decision D33), not BenchmarkDotNet — this measures concurrent
+         load (negotiate throughput, sustained fan-out, connection ramp, memory per connection),
+         which BDN's tight single-threaded iteration loops cannot answer (Phase 5 finding 7). -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.10" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Keryhe.Switchboard.Core\Keryhe.Switchboard.Core.csproj" />
+    <ProjectReference Include="..\..\src\Keryhe.Switchboard.Server\Keryhe.Switchboard.Server.csproj" />
+  </ItemGroup>
+
+</Project>

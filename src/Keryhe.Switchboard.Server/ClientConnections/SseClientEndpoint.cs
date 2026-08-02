@@ -110,10 +110,12 @@ public static class SseClientEndpoint
             await foreach (var frame in transport.Output.Reader.ReadAllAsync(ct))
             {
                 // 03-protocol.md §1.5: "data: " + frame (which already carries its own trailing
-                // \x1e record separator) + a blank line.
+                // \x1e record separator) + a blank line, terminated CRLF — the .NET 8 SignalR
+                // client's SSE parser rejects a bare "\n\n" (FormatException: Unexpected '\n'),
+                // even though the .NET 10 client tolerates it.
                 await context.Response.WriteAsync("data: ", ct);
                 await context.Response.Body.WriteAsync(frame, ct);
-                await context.Response.WriteAsync("\n\n", ct);
+                await context.Response.WriteAsync("\r\n\r\n", ct);
                 await context.Response.Body.FlushAsync(ct);
             }
         }

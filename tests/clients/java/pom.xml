@@ -1,0 +1,40 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- Phase 5 D30/D34 client probe (Java). Pinned to 9.0.6 — the newest stable release; no stable
+       10.x com.microsoft.signalr:signalr exists on Maven Central (finding 5), only a
+       10.0.0-preview.5. Built and run inside a maven:3-eclipse-temurin-17 container
+       (JavaClientContainerFixture.cs) rather than requiring mvn/gradle on the host, since neither
+       is installed here (finding 5). -->
+  <groupId>keryhe.switchboard.compat</groupId>
+  <artifactId>java-probe</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+
+  <properties>
+    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.target>17</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.microsoft.signalr</groupId>
+      <artifactId>signalr</artifactId>
+      <version>9.0.6</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.2.0</version>
+        <configuration>
+          <mainClass>Probe</mainClass>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

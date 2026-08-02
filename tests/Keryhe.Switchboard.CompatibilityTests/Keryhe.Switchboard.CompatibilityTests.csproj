@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Reused as-is from IntegrationTests (Phase 1) rather than duplicated — same
+         out-of-process-`dotnet`-host spawn/health-check/graceful-stop shape every probe cell needs. -->
+    <Compile Include="..\Keryhe.Switchboard.IntegrationTests\ProcessFixture.cs" Link="TestSupport\ProcessFixture.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Keryhe.Switchboard.Core\Keryhe.Switchboard.Core.csproj" />
+    <ProjectReference Include="..\..\src\Keryhe.Switchboard.Protocol\Keryhe.Switchboard.Protocol.csproj" />
+    <ProjectReference Include="..\..\src\Keryhe.Switchboard.Server\Keryhe.Switchboard.Server.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Not a ProjectReference (different, older TargetFramework) — the probe is built once by the
+         solution build and located at run time by ProbeRunner, the same way ProcessFixture locates
+         Keryhe.Switchboard.Server.dll / SampleChatApp.Api.dll. -->
+    <None Include="..\clients\dotnet8\DotNet8Probe.csproj" />
+  </ItemGroup>
+
+</Project>

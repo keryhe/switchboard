@@ -31,6 +31,10 @@ Two roadmap corrections recorded during Phase 4, not silently substituted: **`si
 
 One bug worth knowing about, found only because the full suite was run repeatedly under parallel load rather than in isolation: **a test-only `MeterListener`/`ActivityListener` helper collected measurements into a plain `List<T>`**, which is not thread-safe against the concurrent `Counter.Add()`/`Histogram.Record()` calls real ASP.NET Core request threads make. A rare `InvalidOperationException` thrown *out of the production instrumentation call itself* (not the test's own code) silently aborted whatever ran immediately after it in that method body, intermittently hanging a test for its full timeout with no other symptom. Fixed by switching to `ConcurrentQueue<T>`. **If you write a MeterListener/ActivityListener-based test, use a concurrent collection for what the callback records** — a plain `List<T>` will pass every time you run it alone and fail unpredictably only under real parallel load.
 
+**Phase 5 (Compatibility Testing & Benchmarking) is complete and the milestone is green.** All six slices from [plans/phase-5-compatibility-testing-and-benchmarking.md](plans/phase-5-compatibility-testing-and-benchmarking.md) are implemented: a real SDK × transport × protocol compatibility matrix generated into [docs/docs/11-compatibility-matrix.md](docs/docs/11-compatibility-matrix.md) (.NET 8, .NET 10, JS 8.0.17/10.0.0, Java 9.0.6 — Slices 1-2); three known incompatibilities pinned as executable assertions and the client-results decision (D32: documented non-goal + a Switchboard-specific `NotSupportedException`, not full support) plus a reflection-based `HubLifetimeManager<THub>` coverage gate (Slice 3); `Keryhe.Switchboard.Benchmarks` (BenchmarkDotNet, per-operation cost — Slice 4) and `Keryhe.Switchboard.LoadHarness` (a plain console app, concurrent load — Slice 5, split per plan decision D33 since BenchmarkDotNet cannot answer concurrent-load questions), with observed numbers in [docs/docs/12-performance.md](docs/docs/12-performance.md). 233 unit tests + 3 integration tests pass (the Phase 4 baseline plus six new Slice 3 tests), plus 21 tests in the new `Keryhe.Switchboard.CompatibilityTests` project. Full results: [docs/docs/00-review-findings.md § Phase 5 Results](docs/docs/00-review-findings.md#phase-5-compatibility-testing--benchmarking-results-2026-08-02).
+
+Phase 5 was this project's first **validation** phase rather than a construction phase, and it found a real, 100%-reproducible bug before a single slice shipped: **the .NET 8 SignalR client could not connect over SSE at all.** `SseClientEndpoint.WriteOutputAsync` terminated every SSE event with a bare `"\n\n"`; the .NET 8 client's SSE parser requires `"\r\n\r\n"` and rejects LF-only termination with `FormatException: Unexpected '\n' in message`, while the .NET 10 client silently tolerates either. **Every one of the 227 tests passing at the end of Phase 4 drove a .NET 10 client** — a correctly-parameterized transport × protocol matrix that never varies the client SDK itself cannot find an SDK-specific defect by construction, no matter how thorough it looks otherwise. Fixed with a two-character change; reproduced deliberately first (reverted the fix, watched the SSE cell fail with the exact reported exception, then restored it) — the same discipline this project has used since Phase 1, here applied to a bug found *before* the phase's own slices were written rather than by them. **If you add a new client SDK, client SDK version, or anything else that varies "which real client library" rather than "which transport/protocol," assume it can find a defect none of the existing SDK-fixed tests can see — that is exactly what happened here.** A second SDK-only defect turned up the same way in Slice 2: the Java client's `LongPollingTransport` doesn't attach the access token to its establishing request at all (a 401, confirmed via the service's own request log, with `accessTokenProvider` configured identically to the working WebSockets cell) — recorded as a documented SDK limitation rather than chased into the library's internals, since this project's actual usage is .NET/JS-centric.
+
 > **Update this file after each phase completes.** When a phase (Phase 0, Phase 1, ...) is finished, revise "Project Status" to name the new current phase, and update any other section here that the completed phase changed (solution layout once scaffolded, architecture notes if implementation diverged from the design docs, etc.).
 
 ## What This Project Is
@@ -49,9 +53,14 @@ dotnet build Switchboard.sln
 dotnet test tests/Keryhe.Switchboard.UnitTests/Keryhe.Switchboard.UnitTests.csproj
 dotnet test tests/Keryhe.Switchboard.IntegrationTests/Keryhe.Switchboard.IntegrationTests.csproj
 dotnet test tests/Keryhe.Switchboard.UnitTests/Keryhe.Switchboard.UnitTests.csproj --filter "FullyQualifiedName~SomeTestClass.SomeTestMethod"   # single test
+dotnet test tests/Keryhe.Switchboard.CompatibilityTests/Keryhe.Switchboard.CompatibilityTests.csproj   # Phase 5: SDK x transport x protocol matrix; needs the solution built first (spawns real dotnet8/js/java probes) and Docker for the Java row (D34, no-op-with-a-message when absent)
 
 # Generate a server or management access token (CLI mode of the Server host — see Cli/TokenCommand.cs):
 dotnet run --project src/Keryhe.Switchboard.Server --no-build -- token generate --role appserver --server-id chat-api-1 --hubs chatHub --ttl 24h --key <ServerSigningKey>
+
+# Phase 5 microbenchmarks (BenchmarkDotNet) and load harness (plain console app, D33) — both need Release, neither runs as part of `dotnet test`:
+dotnet run -c Release --project tests/Keryhe.Switchboard.Benchmarks
+dotnet run -c Release --project tests/Keryhe.Switchboard.LoadHarness -- --target-clients 10000   # add --skip-otlp to omit the Docker-based latency cross-check
 ```
 
 Note: the milestone integration test spawns `Keryhe.Switchboard.Server.dll` and `SampleChatApp.Api.dll` as **real out-of-process Kestrel servers** (`tests/Keryhe.Switchboard.IntegrationTests/ProcessFixture.cs`), so build the solution first or it will fail on a missing assembly. Several unit tests likewise boot a real Kestrel host (`TestSupport/RealKestrelServerFixture.cs`) rather than `WebApplicationFactory`, because `TestServer`'s in-memory transport cannot do real WebSocket upgrades — a real `HubConnection` needs a real socket.
@@ -111,7 +120,7 @@ An app server token must never be able to drive the management API, and vice ver
 
 `IClientTransport` (Core, transport-agnostic) → `IFramedClientTransport` (Server; adds `Framing` and `SupportsBinaryTransferFormat`) → `IPostableClientTransport` (adds `FeedAsync`, for SSE/Long Polling, whose inbound frames arrive over a separate HTTP request from whatever request is currently serving output). `ClientConnectionLifecycle` — handshake negotiation, registration, the message loop, the keep-alive ping loop, teardown — is written once against this hierarchy and reused unchanged by all three transports (`WebSocketClientTransport`, `SseClientTransport`, `LongPollingClientTransport`); only how bytes physically get in and out differs per transport. SSE is deliberately Text-only (`SupportsBinaryTransferFormat: false`) and negotiate advertises it that way — a MessagePack-over-SSE handshake is rejected explicitly rather than silently corrupting binary data. Long Polling's connection lifecycle uniquely spans many independent short-lived HTTP requests rather than one long-lived one; a background `LongPollingReaperService` closes any transport whose last poll exceeds `DisconnectTimeout`, since there's no socket-close event to notice abandonment.
 
-### Solution layout (current — Phase 4)
+### Solution layout (current — Phase 5)
 
 ```
 Switchboard.sln
@@ -122,18 +131,21 @@ Switchboard.sln
 │   ├── Keryhe.Switchboard.Registry/    # InMemoryConnectionRegistry, InMemoryHubRegistry, PendingConnectionStore, LocalTransportRegistry, NoOpBackplane, LocalReadinessProbe, LocalTransportOwnershipRegistry, NullNodeAddressResolver, LocalClusterInventory (Phase 4) — the single-node/in-memory half of every Orleans substitution
 │   ├── Keryhe.Switchboard.Orleans/     # Phase 3: grains (Grains/), observer backplane (Observers/), OrleansReadinessProbe, NodeRegistryPublisherService, vendored ADO.NET SQL scripts (Sql/) — no vendor-specific database dependency of its own (Slice 6); OrleansClusterInventory + IHubGrain.GetStatsAsync + the cluster-wide hub/node directory on INodeRegistryGrain (Phase 4)
 │   ├── Keryhe.Switchboard.Management/  # Phase 4: /api/v1 route group mapped into the Server's own WebApplication (not a separate host) — group/send/connections/health endpoints, ManagementAuthFilter, AddOpenApi()/MapOpenApi(); depends on Core + Protocol, never Orleans (IClusterInventory keeps cluster reads substitutable)
-│   └── Keryhe.Switchboard.Connector/   # app-server-side package (replaces AddAzureSignalR()) — negotiate interception, inbound dispatch, HubLifetimeManager, connection pool
+│   └── Keryhe.Switchboard.Connector/   # app-server-side package (replaces AddAzureSignalR()) — negotiate interception, inbound dispatch, HubLifetimeManager (its InvokeConnectionAsync/SetConnectionResultAsync overrides, Phase 5 D32, throw a Switchboard-specific NotSupportedException for client results rather than the framework's bare default), connection pool
 ├── tests/
-│   ├── Keryhe.Switchboard.UnitTests/    # includes real-Kestrel-host e2e tests (TestSupport/RealKestrelServerFixture) since WebApplicationFactory's TestServer can't do real WebSockets; PostgresContainerFixture and OtlpCollectorContainerFixture (Phase 4) each spin up a throwaway container via the docker CLI for the ADO.NET clustering gates and the OTLP-collector milestone respectively
-│   └── Keryhe.Switchboard.IntegrationTests/  # out-of-process tests (ProcessFixture spawns real `dotnet` processes, with graceful SIGTERM stop/restart support for Phase 3 Slice 7); links PostgresContainerFixture from UnitTests rather than duplicating it
+│   ├── Keryhe.Switchboard.UnitTests/         # includes real-Kestrel-host e2e tests (TestSupport/RealKestrelServerFixture) since WebApplicationFactory's TestServer can't do real WebSockets; PostgresContainerFixture and OtlpCollectorContainerFixture (Phase 4) each spin up a throwaway container via the docker CLI for the ADO.NET clustering gates and the OTLP-collector milestone respectively; KnownIncompatibilityTests/ClientResultsTests/HubLifetimeManagerCoverageTests (Phase 5 Slice 3) live here rather than under CompatibilityTests below, since they need the same in-process Connector + RealKestrelServerFixture wiring ConnectorEndToEndTests already has
+│   ├── Keryhe.Switchboard.IntegrationTests/  # out-of-process tests (ProcessFixture spawns real `dotnet` processes, with graceful SIGTERM stop/restart support for Phase 3 Slice 7); links PostgresContainerFixture from UnitTests rather than duplicating it
+│   ├── Keryhe.Switchboard.CompatibilityTests/  # Phase 5: the SDK × transport × protocol matrix (Slices 1-3) — spawns real out-of-process Server+SampleChatApp.Api via SampleAppHost (ProcessFixture-based), drives client probes (tests/clients/ below) via ProbeRunner, generates docs/docs/11-compatibility-matrix.md (D36); JavaClientContainerFixture/JsClientFixture are the Docker/npm-gated pieces (D34)
+│   ├── Keryhe.Switchboard.Benchmarks/   # Phase 5 Slice 4: BenchmarkDotNet 0.15.8, MemoryDiagnoser on — per-operation hot-path cost only, no sockets (envelope serialization, frame parsing, HubMessageClassifier.IsPing, DefaultMessageRouter fan-out at 1/100/1k/10k, ManagementInvocationWriter)
+│   └── Keryhe.Switchboard.LoadHarness/  # Phase 5 Slice 5: plain console app, concurrent load (D33 — BenchmarkDotNet can't answer this) — connection ramp, sustained fan-out, memory-per-connection, host-limits/failure-classification (D35), OTLP percentile cross-check; generates docs/docs/12-performance.md from a real run
+├── tests/clients/                       # Phase 5: one client probe per SDK (D30's shared scenario contract) — dotnet8/ (net8.0, pinned SignalR.Client 8.0.29), js/v8 and js/v10 (@microsoft/signalr 8.0.17 and 10.0.0), java/ (com.microsoft.signalr 9.0.6, built/run in a maven container, no local mvn/gradle required)
 └── samples/
     └── SampleChatApp/
-        ├── SampleChatApp.Api/          # ASP.NET Core Web API using the Connector
-        ├── SampleChatApp.Angular/      # Angular SPA — chat UI, @microsoft/signalr client (Phase 2, Slice 9)
-        └── js-redirect-check/          # @microsoft/signalr redirect-check script, retargeted at SampleChatApp.Api (Phase 2, Slice 9)
+        ├── SampleChatApp.Api/          # ASP.NET Core Web API using the Connector; .AddMessagePackProtocol() added in Phase 5 (Slice 1) — without it every MessagePack client was rejected outright
+        └── SampleChatApp.Angular/      # Angular SPA — chat UI, @microsoft/signalr client (Phase 2, Slice 9); its own client stack is exercised headlessly by tests/clients/js (Phase 5) rather than by a separate browser-driven test — js-redirect-check (a manual script nothing ran automatically) was retired in favor of that
 ```
 
-Full dependency graph and NuGet package list: [docs/docs/06-project-plan.md](docs/docs/06-project-plan.md). Management API and observability design detail: [docs/docs/04-design.md §12-13](docs/docs/04-design.md#12-management-api-phase-4). Operations guide (token rotation, secret storage, metrics reference): [docs/docs/10-operations.md](docs/docs/10-operations.md).
+Full dependency graph and NuGet package list: [docs/docs/06-project-plan.md](docs/docs/06-project-plan.md). Management API and observability design detail: [docs/docs/04-design.md §12-13](docs/docs/04-design.md#12-management-api-phase-4). Operations guide (token rotation, secret storage, metrics reference): [docs/docs/10-operations.md](docs/docs/10-operations.md). Compatibility matrix and observed performance limits (Phase 5, generated from real runs, not hand-maintained): [docs/docs/11-compatibility-matrix.md](docs/docs/11-compatibility-matrix.md), [docs/docs/12-performance.md](docs/docs/12-performance.md).
 
 ## Documentation Map
 
@@ -152,6 +164,9 @@ Read in this order when picking up unfamiliar work:
 | [docs/docs/07-adr/](docs/docs/07-adr/) | Why, not just what, for the five foundational decisions |
 | [docs/docs/08-sample-app.md](docs/docs/08-sample-app.md) | Reference sample app used as the end-to-end integration target |
 | [docs/docs/09-phase0-findings/](docs/docs/09-phase0-findings/) | Verified .NET 10 framework facts from the Phase 0 spike (API recon, the required synthetic-connection feature set, the two design-doc corrections) — preserved when `spike/` was retired |
+| [docs/docs/10-operations.md](docs/docs/10-operations.md) | Token rotation, secret storage, metrics reference (Phase 4) |
+| [docs/docs/11-compatibility-matrix.md](docs/docs/11-compatibility-matrix.md) | Which SDK × transport × protocol cells actually work — generated from a real run (Phase 5, D36), not hand-maintained |
+| [docs/docs/12-performance.md](docs/docs/12-performance.md) | Observed connection/throughput/memory limits and the tuning guide written from them — generated from one real load-harness run (Phase 5, D33/D35) |
 
 `00-review-findings.md` is a living log — when a design decision changes during implementation, that's the place resolutions get recorded, and it should be checked before treating any of the other docs as final on a contested point.
 
@@ -159,6 +174,7 @@ Read in this order when picking up unfamiliar work:
 
 - Multi-tenancy
 - Message persistence/replay, including stateful reconnect (`.withStatefulReconnect()`) — clients that request it fall back to standard reconnect
+- Client results (`Clients.Client(id).InvokeAsync<T>(...)`, .NET 8+) — same structural reason as stateful reconnect; hub code gets a Switchboard-specific `NotSupportedException`, not the framework's bare default (Phase 5, plan decision D32)
 - Azure Functions/serverless trigger mode
 - Protocol translation to non-SignalR protocols (MQTT, AMQP, gRPC streams)
 - Full Azure SignalR Service management API parity

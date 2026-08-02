@@ -1,0 +1,11 @@
+{
+  "name": "switchboard-js-probe-v10",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Phase 5 D30 client probe — @microsoft/signalr 10.0.0. See ../../../Keryhe.Switchboard.CompatibilityTests/ClientProbeContract.md for the scenario.",
+  "dependencies": {
+    "@microsoft/signalr": "10.0.0",
+    "@microsoft/signalr-protocol-msgpack": "10.0.0"
+  }
+}

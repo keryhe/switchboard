@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>DotNet8Probe</AssemblyName>
+    <RootNamespace>DotNet8Probe</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Pinned to 8.0.29, not the advisory-affected 8.0.17 (Phase 5 finding 6) — tests/ has no
+         TreatWarningsAsErrors (src/Directory.Build.props scopes it to src/ only), so an unpatched
+         pin would restore and build with only a NU1903 warning. -->
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="8.0.29" />
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.Protocols.MessagePack" Version="8.0.29" />
+  </ItemGroup>
+
+</Project>

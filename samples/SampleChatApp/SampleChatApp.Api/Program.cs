@@ -37,7 +37,10 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 
 builder.Services.AddAuthorization();
 
-builder.Services.AddSignalR();
+// .AddMessagePackProtocol() is required for a MessagePack client to negotiate against this app
+// server at all — HubConnectionHandler's IHubProtocolResolver only knows protocols the app
+// server registered (Phase 5 finding 3).
+builder.Services.AddSignalR().AddMessagePackProtocol();
 builder.Services.AddSwitchboardConnector(options =>
 {
     options.ServiceUrl = builder.Configuration["Switchboard:Url"]!;

@@ -1,0 +1,11 @@
+{
+  "name": "switchboard-js-probe-v8",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Phase 5 D30 client probe — @microsoft/signalr 8.0.17 (finding 9). See ../../../Keryhe.Switchboard.CompatibilityTests/ClientProbeContract.md for the scenario.",
+  "dependencies": {
+    "@microsoft/signalr": "8.0.17",
+    "@microsoft/signalr-protocol-msgpack": "8.0.17"
+  }
+}
